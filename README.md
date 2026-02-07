@@ -1,90 +1,90 @@
 # Rust_Multi_Branch-Transformer_Architecture
 
-Implementierung und Referenzdokumentation einer **Multi-Branch-Transformer-Architektur (MBT)** in **Rust**. Der Schwerpunkt liegt auf **intra-layer Parallelität (Width)** mit **expliziter Aggregation**, ergänzt um eine **BPE-Tokenizer-Pipeline**, **Training/Inference** sowie **reproduzierbare Checkpoints** (Tokenizer + Parameter) als geschlossenes, analysierbares System. Die Architektur ist so beschrieben, dass sie als Grundlage für **verteilte Ausführung** (u. a. P2P-Topologien) sowie für **fehlertolerante und kontinuierlich erweiterbare** Transformer-Systeme dient.
+Implementation and reference documentation of a **Multi-Branch Transformer Architecture (MBT)** in **Rust**. The focus is on **intra-layer parallelism (width)** with **explicit aggregation**, complemented by a **BPE tokenizer pipeline**, **training/inference**, and **reproducible checkpoints** (tokenizer + parameters) as a closed, analyzable system. The architecture is described to serve as a foundation for **distributed execution** (including P2P topologies) as well as for **fault-tolerant and continuously extensible** transformer systems.
 
-## Inhalt
-- [Motivation und Zielsetzung](#motivation-und-zielsetzung)
-- [Kernidee: Multi-Branch Transformer (MBT)](#kernidee-multi-branch-transformer-mbt)
+## Contents
+- [Motivation and Objectives](#motivation-and-objectives)
+- [Core Idea: Multi-Branch Transformer (MBT)](#core-idea-multi-branch-transformer-mbt)
 - [Features](#features)
-- [Architekturüberblick](#architekturüberblick)
+- [Architecture Overview](#architecture-overview)
 - [Installation](#installation)
-- [Build und Run](#build-und-run)
-- [Nutzung (CLI)](#nutzung-cli)
+- [Build and Run](#build-and-run)
+- [Usage (CLI)](#usage-cli)
 - [Training](#training)
 - [Inference](#inference)
-- [Checkpoints und Reproduzierbarkeit](#checkpoints-und-reproduzierbarkeit)
-- [Verteilte Ausführung und Fault Tolerance (Konzept)](#verteilte-ausführung-und-fault-tolerance-konzept)
-- [Sicherheit und Robustheit (Systemperspektive)](#sicherheit-und-robustheit-systemperspektive)
-- [Abgrenzung zu MoE / Switch / Multi-Path](#abgrenzung-zu-moe--switch--multi-path)
+- [Checkpoints and Reproducibility](#checkpoints-and-reproducibility)
+- [Distributed Execution and Fault Tolerance (Concept)](#distributed-execution-and-fault-tolerance-concept)
+- [Security and Robustness (System Perspective)](#security-and-robustness-system-perspective)
+- [Distinction from MoE / Switch / Multi-Path](#distinction-from-moe--switch--multi-path)
 - [Roadmap](#roadmap)
-- [Zitation](#zitation)
-- [Quellen (APA)](#quellen-apa)
-- [Lizenz](#lizenz)
-- [Kontakt](#kontakt)
+- [Citation](#citation)
+- [References (APA)](#references-apa)
+- [License](#license)
+- [Contact](#contact)
 
 ---
 
-## Motivation und Zielsetzung
+## Motivation and Objectives
 
-Große Transformer-Modelle sind in realen Inferenz-Deployments häufig nicht primär durch Rechenoperationen limitiert, sondern durch **Speicherbedarf**, **Speicherbandbreite**, **KV-Cache-Management** sowie **Kommunikations- und Synchronisationskosten** in verteilten Umgebungen. Klassische Partitionierungen entlang der **Tiefe** reduzieren zwar den Speicherbedarf pro Node, erzwingen jedoch weiterhin eine **sequenzielle Token-Verarbeitungskette** und lassen damit potenzielle Parallelitätsgewinne strukturell ungenutzt, insbesondere in **heterogenen** und **volatilen** Ausführungsumgebungen.
+In real inference deployments, large transformer models are often not primarily limited by compute operations, but by **memory footprint**, **memory bandwidth**, **KV-cache management**, and **communication and synchronization costs** in distributed environments. Classical partitioning along **depth** does reduce memory requirements per node, but it still enforces a **sequential token-processing chain**, leaving potential parallelism gains structurally underutilized&mdash;particularly in **heterogeneous** and **volatile** execution environments.
 
-Das Repository adressiert diese Lage durch eine **Multi-Branch-Topologie**, bei der Parallelität als **Breitenstruktur innerhalb eines Layers** organisiert wird: Mehrere Transformer-Blöcke bzw. Block-Sequenzen werden **zeitgleich** ausgeführt und ihre Pfadausgaben werden anschließend über eine **Aggregationsstufe** fusioniert, was zugleich eine natürliche **Partitionierungs- und Orchestrierungseinheit** für verteilte Ressourcen bereitstellt.
+This repository addresses this situation via a **multi-branch topology** in which parallelism is organized as a **width structure within a layer**: multiple transformer blocks or block sequences are executed **concurrently**, and their path outputs are subsequently fused through an **aggregation stage**, which simultaneously provides a natural **partitioning and orchestration unit** for distributed resources.
 
 ---
 
-## Kernidee: Multi-Branch Transformer (MBT)
+## Core Idea: Multi-Branch Transformer (MBT)
 
-Ein MBT-Layer enthält eine Menge paralleler Pfade \( \{TB_{l,1}, \dots, TB_{l,K}\} \), die denselben Layer-Input verarbeiten und Pfadausgaben \( z_i^{(l)} \) erzeugen; die Layerausgabe entsteht als gewichtete Aggregation
+An MBT layer contains a set of parallel paths \( \{TB_{l,1}, \dots, TB_{l,K}\} \) that process the same layer input and produce path outputs \( z_i^{(l)} \). The layer output is formed as a weighted aggregation:
 
 \[
 h^{(l+1)} = \sum_{i=1}^{K} \alpha_i^{(l)} \, z_i^{(l)}, \quad \alpha_i^{(l)} \ge 0, \quad \sum_{i=1}^{K} \alpha_i^{(l)} = 1.
 \]
 
-Diese Aggregation fungiert als zentrale Systemkomponente, weil sie zugleich **Fusion**, **Gewichtung**, **Ausfallbehandlung** (Maskierung/Renormalisierung) sowie **Governance-Regeln** gegen Pfad-Verarmung und Gewichtskollaps strukturell ermöglicht.
+This aggregation functions as a central system component because it structurally enables **fusion**, **weighting**, **failure handling** (masking/renormalization), and **governance rules** against path impoverishment and weight collapse.
 
 ---
 
 ## Features
 
-- **Multi-Branch Transformer Layer** (Width-Parallelität mit Aggregation)
-- **BPE Tokenizer** mit persistierter Konfiguration für deterministische Rekonstruktion
-- **Training Loop** für autoregressives Next-Token-Training (Pretraining und Instruction-Tuning als Varianten)
-- **Inference** (greedy decoding; je nach Stand optional Temperature / top-k / top-p)
-- **Checkpointing**: Speichern und Laden von Tokenizer + Modellparametern
-- **Load with Rebuild**: Rekonstruktion des Modells anhand der im Checkpoint gespeicherten Vokabulargröße zur Vermeidung von Shape-Mismatches
-- **Robustheitsmechanismen** (u. a. Validierungen, Parameterlängenprüfungen, atomare Writes; abhängig vom Implementationsstand)
+- **Multi-Branch Transformer Layer** (width parallelism with aggregation)
+- **BPE tokenizer** with persisted configuration for deterministic reconstruction
+- **Training loop** for autoregressive next-token training (pretraining and instruction tuning as variants)
+- **Inference** (greedy decoding; depending on status optionally temperature / top-k / top-p)
+- **Checkpointing**: saving and loading tokenizer + model parameters
+- **Load with Rebuild**: reconstructing the model based on the vocabulary size stored in the checkpoint to prevent shape mismatches
+- **Robustness mechanisms** (including validations, parameter-length checks, atomic writes; depending on implementation status)
 
 ---
 
-## Architekturüberblick
+## Architecture Overview
 
-Die Codebasis folgt einem „self-contained“-Ansatz, bei dem Tokenisierung, Modell, Training, Inferenz und Persistenz in einem nachvollziehbaren Workflow integriert sind. Typische Komponenten sind:
+The codebase follows a &ldquo;self-contained&rdquo; approach in which tokenization, model, training, inference, and persistence are integrated into a traceable workflow. Typical components include:
 
-- **Tokenizer**: BPE-Training, Encode/Decode, persistierte Tokenizer-Konfiguration
-- **Model Core**: Embeddings, Self-Attention, Feed-Forward, LayerNorm, Transformer-Blöcke
-- **MBT-Erweiterung**: parallele Branches pro Layer und Aggregationslogik
-- **Optimierung**: z. B. Adam; optional Gradient Clipping
-- **Persistenz**: Checkpoint-Format mit Versionierung/Magic-Value und atomarem Schreiben
+- **Tokenizer**: BPE training, encode/decode, persisted tokenizer configuration
+- **Model core**: embeddings, self-attention, feed-forward, layer norm, transformer blocks
+- **MBT extension**: parallel branches per layer and aggregation logic
+- **Optimization**: e.g., Adam; optional gradient clipping
+- **Persistence**: checkpoint format with versioning/magic value and atomic writing
 
-Hinweis: Die konkreten Modul- und Dateinamen sind abhängig vom aktuellen Repository-Stand; die README beschreibt das Zielbild konsistent mit den bereitgestellten Textgrundlagen.
+Note: Concrete module and file names depend on the current state of the repository; the README describes the target design consistently with the provided textual foundations.
 
 ---
 
 ## Installation
 
-Voraussetzungen:
+Requirements:
 - Rust (stable)
 - Cargo
 
-Optional (empfohlen für Entwicklung):
+Optional (recommended for development):
 - `rustfmt`
 - `clippy`
 
 ---
 
-## Build und Run
+## Build and Run
 
-Build (Release):
+Build (release):
 - `cargo build --release`
 
 Run:
@@ -92,133 +92,131 @@ Run:
 
 ---
 
-## Nutzung (CLI)
+## Usage (CLI)
 
-Das Projekt ist typischerweise CLI-orientiert und stellt (je nach Stand) folgende Flows bereit:
-- Training starten (Pretraining / Instruction-Tuning)
-- Checkpoint speichern
-- Checkpoint laden (inkl. Rebuild)
-- Prompt eingeben und Antwort generieren
+The project is typically CLI-oriented and provides (depending on status) the following flows:
+- start training (pretraining / instruction tuning)
+- save checkpoint
+- load checkpoint (including rebuild)
+- enter a prompt and generate a response
 
-Die konkreten Kommandos, Flags und Menüeinträge sind in `main.rs` bzw. der jeweiligen CLI-Definition zu prüfen.
+Concrete commands, flags, and menu entries should be checked in `main.rs` or the respective CLI definition.
 
 ---
 
 ## Training
 
-Das Training folgt dem autoregressiven Next-Token-Schema: Eingabetokens und Zieltokens entstehen durch eine um 1 verschobene Sequenz, der Loss wird über Cross-Entropy berechnet, und die Gradienten werden per Backpropagation propagiert. In der MBT-Variante ist zusätzlich relevant, dass die **Breitenpfade** fair und stabil trainiert werden, um **Pfad-Verarmung** zu vermeiden, weil andernfalls redundante Pfade im Ausfallfall keine funktionale Ersatzfähigkeit besitzen.
+Training follows the autoregressive next-token scheme: input tokens and target tokens are created by shifting the sequence by 1, the loss is computed via cross-entropy, and gradients are propagated by backpropagation. In the MBT variant, it is additionally relevant that the **width paths** are trained fairly and stably to prevent **path impoverishment**, because otherwise redundant paths do not provide functional substitutability in the event of failure.
 
-Je nach Konfiguration sind folgende Aspekte zentral:
-- Sequenzlängenbegrenzung (z. B. `MAX_SEQ_LEN`)
-- (Optional) Gradient Clipping zur Stabilisierung kleiner, nicht optimierter Implementationen (Pascanu et al., 2013)
-- (Optional) Mini-Batching/Gradient Accumulation (Roadmap, falls noch nicht umgesetzt)
+Depending on configuration, the following aspects are central:
+- sequence-length limitation (e.g., `MAX_SEQ_LEN`)
+- (optional) gradient clipping to stabilize small, non-optimized implementations (Pascanu et al., 2013)
+- (optional) mini-batching/gradient accumulation (roadmap, if not yet implemented)
 
 ---
 
 ## Inference
 
-Inference erfolgt im einfachsten Modus über **greedy decoding**: das wahrscheinlichste Folgetoken wird iterativ ausgewählt, bis EOS erreicht ist oder die maximale Sequenzlänge greift. Sampling-Verfahren wie Temperature / top-k / top-p können je nach Implementationsstand ergänzt oder bereits vorhanden sein; in der Literatur gelten sie als praxisrelevant für Textqualität (Holtzman et al., 2020).
+Inference in the simplest mode uses **greedy decoding**: the most likely next token is iteratively selected until EOS is reached or the maximum sequence length applies. Sampling methods such as temperature / top-k / top-p may be added or already present depending on implementation status; in the literature they are considered practically relevant for text quality (Holtzman et al., 2020).
 
 ---
 
-## Checkpoints und Reproduzierbarkeit
+## Checkpoints and Reproducibility
 
-### Warum „Load with Rebuild“ erforderlich ist
+### Why &ldquo;Load with Rebuild&rdquo; Is Required
 
-Die Output-Projektion besitzt typischerweise die Form \([d_{\text{emb}}, |V|]\), wobei \(|V|\) direkt von der Tokenizer-Vokabulargröße abhängt. Wird beim Laden ein Tokenizer mit anderer Vokabulargröße verwendet, entstehen Shape-Mismatches.
+The output projection typically has shape \([d_{\text{emb}}, |V|]\), where \(|V|\) depends directly on the tokenizer vocabulary size. If a tokenizer with a different vocabulary size is used when loading, shape mismatches occur.
 
-Daher implementiert das System beim Laden (konzeptionell) folgende Schritte:
-1. Checkpoint laden und validieren (Magic/Version)
-2. Tokenizer aus Checkpoint rekonstruieren
-3. Modell **neu aufbauen** (Rebuild) anhand \(|V|\) aus dem Checkpoint
-4. Parametervektor einspielen und Länge/Form prüfen
+Therefore, when loading, the system (conceptually) implements the following steps:
+1. load and validate checkpoint (magic/version)
+2. reconstruct tokenizer from checkpoint
+3. **rebuild** the model based on \(|V|\) from the checkpoint
+4. load the parameter vector and check length/shape
 
-### Atomare Writes
+### Atomic Writes
 
-Beim Speichern wird eine atomare Write-Strategie (Temp-Datei + Rename) eingesetzt, um inkonsistente Checkpoints bei Abbruch oder Systemstörungen zu vermeiden.
+When saving, an atomic write strategy (temporary file + rename) is used to avoid inconsistent checkpoints in the event of interruption or system faults.
 
 ---
 
-## Verteilte Ausführung und Fault Tolerance (Konzept)
+## Distributed Execution and Fault Tolerance (Concept)
 
-Die Multi-Branch-Struktur ist so modelliert, dass **ein Pfad** als **Partitionseinheit** auf unterschiedliche Nodes gelegt werden kann, während eine Aggregationsinstanz die Pfadausgaben fusioniert. Für Ausfallsicherheit wird eine Maskierung \(m_i^{(l)} \in \{0,1\}\) verwendet; die Gewichte werden im Ausfallfall renormalisiert:
+The multi-branch structure is modeled such that **one path** can serve as a **partition unit** mapped to different nodes, while an aggregation instance fuses the path outputs. For fault tolerance, a masking variable \(m_i^{(l)} \in \{0,1\}\) is used; weights are renormalized in the event of failure:
 
 \[
-\tilde{\alpha}_i^{(l)} = \frac{m_i^{(l)} \alpha_i^{(l)}}{\sum_{j=1}^{K} m_j^{(l)} \alpha_j^{(l)}} \quad (\text{sofern Nenner} > 0),
+\tilde{\alpha}_i^{(l)} = \frac{m_i^{(l)} \alpha_i^{(l)}}{\sum_{j=1}^{K} m_j^{(l)} \alpha_j^{(l)}} \quad (\text{if denominator} &gt; 0),
 \quad
 \tilde{h}^{(l+1)} = \sum_{i=1}^{K} \tilde{\alpha}_i^{(l)} z_i^{(l)}.
 \]
 
-Damit bleibt die Layerfunktion wohldefiniert, solange mindestens ein Pfad verfügbar ist. In P2P-Settings sind Quorum-/Timeout-Policies sowie Anti-Weight-Collapse-Regeln methodisch zentral, um Tail-Latency und Single-Point-of-Failure-Effekte zu begrenzen.
+Thus, the layer function remains well-defined as long as at least one path is available. In P2P settings, quorum/timeout policies and anti-weight-collapse rules are methodologically central to limit tail latency and single-point-of-failure effects.
 
 ---
 
-## Sicherheit und Robustheit (Systemperspektive)
+## Security and Robustness (System Perspective)
 
-In offenen oder teiloffenen verteilten Umgebungen erhöhen parallele Pfade die Angriffsfläche (Byzantinische Outputs, Straggling/DoS, Update-Poisoning). Ein MBT-System benötigt daher typischerweise:
-- Integrität von Modellartefakten (Hashes/Signaturen/Versionierung)
-- Quorum-/Timeout-Policies gegen Straggler-Tail-Latency
-- Norm- und Gewichtskontrollen in der Aggregation
-- (Optional) Admission Control für neue Pfade bei „Continuous Expandable Width“
+In open or semi-open distributed environments, parallel paths increase the attack surface (Byzantine outputs, straggling/DoS, update poisoning). An MBT system therefore typically requires:
+- integrity of model artifacts (hashes/signatures/versioning)
+- quorum/timeout policies against straggler tail latency
+- norm and weight controls in the aggregation
+- (optional) admission control for new paths under &ldquo;continuous expandable width&rdquo;
 
-Eine Blockchain kann konzeptionell als Governance- und Audit-Schicht dienen, ist jedoch nicht als Ausführungsumgebung des Modells intendiert, sondern als Root-of-Trust für Identität, Artefakt-Hashes und Update-Freigaben.
+A blockchain can conceptually serve as a governance and audit layer, but it is not intended as the model&rsquo;s execution environment; rather, it acts as a root of trust for identity, artifact hashes, and update approvals.
 
 ---
 
-## Abgrenzung zu MoE / Switch / Multi-Path
+## Distinction from MoE / Switch / Multi-Path
 
-- **MoE/Switch**: Breite wird primär über **sparsames, tokenweises Routing** auf wenige Expert*innen realisiert; Ziel ist Parameter-Skalierung bei begrenztem Compute pro Token (Shazeer et al., 2017; Fedus et al., 2022).
-- **Multi-Path (Residual-Interpretation)**: beschreibt Mehrpfadigkeit eher analytisch als explizite, orchestrierbare Parallelstruktur (Veit et al., 2016).
-- **MBT**: definiert Mehrpfadigkeit als **gleichzeitig aktive Pfade pro Layer** mit **expliziter Aggregation**, wodurch Verteilbarkeit, Robustheit und kontinuierliche Erweiterbarkeit systematisch adressiert werden.
+- **MoE/Switch**: width is primarily realized via **sparse, token-wise routing** to a small number of experts; the goal is parameter scaling with limited compute per token (Shazeer et al., 2017; Fedus et al., 2022).
+- **Multi-Path (residual interpretation)**: describes multi-path behavior more analytically than as an explicit, orchestratable parallel structure (Veit et al., 2016).
+- **MBT**: defines multi-pathness as **simultaneously active paths per layer** with **explicit aggregation**, thereby systematically addressing distributability, robustness, and continuous extensibility.
 
 ---
 
 ## Roadmap
 
-Mögliche nächste Schritte (abhängig vom aktuellen Stand):
-- **Effiziente Inferenz**: KV-Cache, Batching, Maskierung, Mixed Precision
-- **Verteilungsruntime**: Branch-Discovery, Scheduling, Quorum-basierte Aggregation, Straggler-Management
-- **Robuste Aggregation**: trimmed mean / median-of-means, Reputationsgewichte, Anti-Verarmungs-Governance
-- **Continuous Learning Governance**: Update-Validierung, Rollback, Poisoning-Detektion
-- **Tests**: Tokenizer-Determinismus, Softmax-Stabilität, Checkpoint-Roundtrip, Golden-Tests
+Possible next steps (depending on current status):
+- **Efficient inference**: KV cache, batching, masking, mixed precision
+- **Distribution runtime**: branch discovery, scheduling, quorum-based aggregation, straggler management
+- **Robust aggregation**: trimmed mean / median-of-means, reputation weights, anti-impoverishment governance
+- **Continuous learning governance**: update validation, rollback, poisoning detection
+- **Tests**: tokenizer determinism, softmax stability, checkpoint round-trip, golden tests
 
 ---
 
-## Zitation
+## Citation
 
-Wenn Inhalte aus dem Projekt zitiert werden, wird eine Referenz auf dieses Repository sowie auf die im Projektkontext genannten Quellen empfohlen (siehe unten).
-
----
-
-## Quellen (APA)
-
-Dean, J., Corrado, G., Monga, R., Chen, K., Devin, M., Le, Q. V., Mao, M. Z., Ranzato, M., Senior, A., Tucker, P., Yang, K., & Ng, A. Y. (2012). Large scale distributed deep networks. In *Advances in Neural Information Processing Systems*.
-
-Fedus, W., Zoph, B., & Shazeer, N. (2022). Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. *Journal of Machine Learning Research, 23*(120), 1–39.
-
-Goodfellow, I., Bengio, Y., & Courville, A. (2016). *Deep learning*. MIT Press.
-
-Holtzman, A., Buys, J., Du, L., Forbes, M., & Choi, Y. (2020). The curious case of neural text degeneration. In *International Conference on Learning Representations*.
-
-Pascanu, R., Mikolov, T., & Bengio, Y. (2013). On the difficulty of training recurrent neural networks. In *International Conference on Machine Learning*.
-
-Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. *arXiv preprint arXiv:1701.06538*.
-
-Veit, A., Wilber, M. J., & Belongie, S. (2016). Residual networks behave like ensembles of relatively shallow networks. In *Advances in Neural Information Processing Systems*.
+If content from the project is cited, a reference to this repository and to the sources mentioned in the project context is recommended (see below).
 
 ---
 
-## Lizenz
+## References (APA)
 
-Siehe `LICENSE` im Repository.
+Dean, J., Corrado, G., Monga, R., Chen, K., Devin, M., Le, Q. V., Mao, M. Z., Ranzato, M., Senior, A., Tucker, P., Yang, K., &amp; Ng, A. Y. (2012). Large scale distributed deep networks. In *Advances in Neural Information Processing Systems*.
+
+Fedus, W., Zoph, B., &amp; Shazeer, N. (2022). Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. *Journal of Machine Learning Research, 23*(120), 1&ndash;39.
+
+Goodfellow, I., Bengio, Y., &amp; Courville, A. (2016). *Deep learning*. MIT Press.
+
+Holtzman, A., Buys, J., Du, L., Forbes, M., &amp; Choi, Y. (2020). The curious case of neural text degeneration. In *International Conference on Learning Representations*.
+
+Pascanu, R., Mikolov, T., &amp; Bengio, Y. (2013). On the difficulty of training recurrent neural networks. In *International Conference on Machine Learning*.
+
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., &amp; Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. *arXiv preprint arXiv:1701.06538*.
+
+Veit, A., Wilber, M. J., &amp; Belongie, S. (2016). Residual networks behave like ensembles of relatively shallow networks. In *Advances in Neural Information Processing Systems*.
 
 ---
 
-## Kontakt
+## License
 
-- Kontakt: mschlieper@expchat.ai
-- Verwandte Implementationen/Referenzen (Projektumfeld):
+See `LICENSE` in the repository.
+
+---
+
+## Contact
+
+- Contact: mschlieper@expchat.ai
+- Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
-
-
