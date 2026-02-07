@@ -1,201 +1,278 @@
-# MBT (Rust) &mdash; MBT - Multi Branch Transformer with BPE Tokenizer, Training, and Checkpoints
+1. Projektüberblick
+Dieses Repository implementiert und dokumentiert eine Multi-Branch-Transformer-Architektur (MBT) in Rust, wobei die Parallelität nicht primär als externe Ausführungsstrategie (z. B. reine Pipeline-Partitionierung entlang der Tiefe), sondern als architektonisch explizite Breitenstruktur innerhalb einzelner Layer modelliert wird: Pro Layer werden mehrere Transformer-Blöcke bzw. Block-Sequenzen gleichzeitig ausgeführt, deren Pfadausgaben anschließend durch eine Aggregationsstufe zu einer gemeinsamen Layerrepräsentation fusionieren.
 
-This repository describes and implements a self-contained Large Language Model (LLM) in Rust, consisting of a compact Transformer architecture, a Byte Pair Encoding (BPE) tokenizer, a simple training loop for pretraining and instruction tuning, and a robust checkpoint format that consistently saves and loads both the tokenizer and model parameters.
+Die technische Motivation ergibt sich aus praktischen Inferenz- und Betriebsengpässen großer Sprachmodelle, die in realen Systemen häufig weniger durch reine FLOP-Komplexität als vielmehr durch Speicherbedarf, Speicherbandbreite, KV-Cache-Management, sowie Kommunikations- und Synchronisationskosten in verteilten Umgebungen bestimmt werden; MBT positioniert die Layerbreite hierbei zugleich als Partitionierungs- und Orchestrierungseinheit für heterogene Infrastruktur, einschließlich Peer-to-Peer-(P2P)-Topologien.
 
-The project addresses the practical necessity of developing a complete LLM as a closed system in which data pipeline, tokenization, model, optimization, inference, and persistence are integrated into a reproducible workflow. It deliberately prioritizes a transparent implementation suitable for expert analysis, debugging, and incremental extension.
+Ergänzend adressiert das Projekt drei systemische Zielklassen, die im MBT-Ansatz als konstitutiv betrachtet werden:
 
-Implemented features:
-- Temperature, top-k, top-p
-- Multi-head attention
-  
-## Contents
+Ausfallsicherheit (Fault Tolerance) durch renormalisierte Aggregation bei partieller Pfadverfügbarkeit,
+Continuous Learning trotz asynchroner, zeitvariabler Teilnahme von Pfaden,
+Continuous Expandable Width als kontrollierte, laufende Erweiterbarkeit der Layerbreite durch konservative Gewichtsinjektion und graduelle Regewichtung.
+2. Architekturkonzept: Multi-Branch Transformer (MBT)
+2.1 Grundprinzip: Parallelität als Layerbreite
+In einem MBT-Layer existiert eine Menge paralleler Pfade 
+{
+T
+B
+l
+,
+1
+,
+…
+,
+T
+B
+l
+,
+K
+}
+{TBl,1​,…,TBl,K​}, die denselben Layer-Input verarbeiten und Pfadausgaben erzeugen; die Layerausgabe ergibt sich aus einer Aggregation über Gewichte 
+α
+i
+(
+l
+)
+αi(l)​ (nichtnegativ, normiert):
 
-- Project overview
-- Architecture and components
-- Tokenizer (BPE) and determinism
-- Training (pretraining and instruction tuning)
-- Inference (greedy decoding)
-- Checkpoints (save and load with rebuild)
-- Data formats
-- Build and run
-- Security and robustness
-- Roadmap toward a complete LLM
-- License and contact
+h
+(
+l
++
+1
+)
+=
+∑
+i
+=
+1
+K
+α
+i
+(
+l
+)
+ 
+z
+i
+(
+l
+)
+.
+h(l+1)=∑i=1K​αi(l)​zi(l)​.
 
-## Project Overview
+Damit entsteht ein System, in dem gleichzeitige Ausführung nicht als Sonderfall der Infrastruktur, sondern als Bestandteil des Modellgraphen definiert ist, wodurch eine explizite Kopplung zwischen Modellstruktur und Verteilbarkeit möglich wird.
 
-The repository implements a compact Transformer pipeline comprising embeddings, multiple Transformer blocks (self-attention, feed-forward, layer normalization), and an output projection onto the token vocabulary. Tokenization is performed via a BPE tokenizer that is persisted in the checkpoint to ensure consistent vocabulary sizes and, consequently, consistent parameter shapes for the output projection.
+2.2 Aggregation als zentrale Orchestrierungs- und Robustheitskomponente
+Die Aggregationsstufe fungiert nicht nur als numerischer Operator, sondern als systemkritische Komponente, weil sie zugleich folgende Funktionen ermöglicht:
 
-A central feature is checkpoint loading with rebuild: when loading, the model is rebuilt based on the tokenizer vocabulary stored in the checkpoint in order to avoid shape mismatches that would otherwise arise as soon as the vocabulary size differs between training and inference.
+Fusion paralleler Pfadausgaben,
+Pfadgewichtung (statisch oder adaptiv),
+Maskierung und Renormalisierung bei Pfadausfall,
+Governance-Regeln gegen Pfad-Verarmung und Gewichtskollaps,
+potenziell robuste Aggregation gegen byzantinische Ausreißerpfade (z. B. trimmed mean / median-of-means als mögliche Erweiterung).
+3. Verteilte Ausführung im P2P-Setting (Konzept)
+Das Repository orientiert sich an der Prämisse, dass MBT insbesondere in P2P- und heterogenen Netzwerken eine natürliche Zuordnung erlaubt: ein Pfad (Branch) entspricht einer klaren Partitionseinheit, die von einer Node übernommen und ausgeführt werden kann, während ein Aggregationsknoten oder ein verteiltes Aggregationsprotokoll die Ergebnisse fusioniert.
 
-## Architecture and Components
+Im Unterschied zu rein sequenzieller Block-Verteilung entlang der Tiefe (die vor allem Speicher pro Node reduziert, jedoch typischerweise keinen parallelen Token-Speedup liefert), kann MBT potenziell die kritische Pfadlänge reduzieren, sofern Straggler- und Netzwerk-Overheads operativ kontrolliert werden (z. B. über Quorum/Timeout-Regeln).
 
-The implementation is consolidated into a small number of modules and emphasizes self-contained executability.
+4. Trainingslogik: Tiefe vs. Breite
+4.1 Tiefentraining (Depth)
+Die Tiefe bleibt als sequenzielle Layerkette kompatibel mit klassischer Backpropagation; das Projekt übernimmt daher das übliche Prinzip schichtweiser Fehlerpropagation.
 
-- `main.rs`
-  - CLI with menu loop
-  - Train, Save, Load, Ask
-  - Initial tokenizer training for immediate usability
-- `layer.rs`
-  - Core of the model (Layer trait, Embeddings, Self Attention, Feed Forward, LayerNorm, TransformerBlock, OutputProjection)
-  - Optimizer (Adam)
-  - Llm with Train, Predict, Save, and Load
-  - Checkpoint structure `LlmCheckpoint`
-- `tokenizer.rs`
-  - BPE training, encoding, decoding
-  - Deterministic training logic and reproducible configuration
-  - Tokenizer checkpoint structure `BpeTokenizerCheckpoint`
-- `train.rs`
-  - Dataset loader for JSON and CSV
-- `utils.rs`
-  - ASCII normalization and utility functions
-  - JSON serialization and atomic file writing
-- `math.rs`
-  - Softmax, cross-entropy, gradient computation, gradient clipping
+4.2 Breitentraining (Width)
+Das Breitentraining erfordert zusätzlich Mechanismen, um parallele Pfade stabil und kapazitätserhaltend zu optimieren, insbesondere um:
 
-The default configuration (as of the current state) uses the following hyperparameters:
+Pfad-Verarmung (untertrainierte Pfade) zu verhindern,
+Dominanz einzelner Pfade (Weight-Collapse) zu vermeiden,
+die Abhängigkeit von singulären Bewertungsregeln zu reduzieren.
+Ein etabliertes Leitprinzip besteht in einer adaptiven Gewichtung der Pfade mit Mindestbeteiligung, sodass jeder Pfad nichttriviale Gradientenexposition erhält und im Ausfallfall nicht bloß „kalte Redundanz“ darstellt.
 
-- `MAX_SEQ_LEN = 80`
-- `EMBEDDING_DIM = 128`
-- `HIDDEN_DIM = 256`
-- 3 Transformer blocks
-- Output projection dimension: `vocab_size` from the tokenizer vocabulary
+5. Ausfallsicherheit (Fault Tolerance)
+MBT modelliert Ausfallrobustheit über eine Maskierungsvariable 
+m
+i
+(
+l
+)
+∈
+{
+0
+,
+1
+}
+mi(l)​∈{0,1} und eine renormalisierte Gewichtung:
 
-## Tokenizer (BPE) and Determinism
+α
+~
+i
+(
+l
+)
+=
+m
+i
+(
+l
+)
+α
+i
+(
+l
+)
+∑
+j
+=
+1
+K
+m
+j
+(
+l
+)
+α
+j
+(
+l
+)
+(
+sofern Nenner
+>
+0
+)
+,
+h
+~
+(
+l
++
+1
+)
+=
+∑
+i
+=
+1
+K
+α
+~
+i
+(
+l
+)
+z
+i
+(
+l
+)
+.
+α~i(l)​=∑j=1K​mj(l)​αj(l)​mi(l)​αi(l)​​(sofern Nenner>0),h~(l+1)=∑i=1K​α~i(l)​zi(l)​.
 
-The BPE tokenizer is trained from the corpus and uses an ASCII-focused preprocessing pipeline that segments whitespace and conservatively separates punctuation to obtain a robust token structure for simple training data.
+Damit bleibt die Layerfunktion wohldefiniert, solange pro Layer mindestens ein Pfad verfügbar ist; die Systemqualität degradiert kontrolliert in Abhängigkeit der entfernten Gewichtmasse, sofern Governance-Regeln (Mindestbeteiligung, Normkontrolle, Quorum/Timeout) implementiert sind.
 
-Reproducibility is supported by a configuration object `BpeTokenizerConfig`, which is persisted in the checkpoint. This enables subsequent analysis of the tokenizer state and its training parameters&mdash;an important requirement for evaluation, debugging, and A/B comparisons (cf. Goodfellow, Bengio, &amp; Courville, 2016).
+6. Continuous Learning und Continuous Expandable Width
+6.1 Continuous Learning (asynchron, partiell)
+Continuous Learning wird als Training unter zeitvariabler Menge aktiver Pfade modelliert; Updates sind damit auch bei partieller Teilnahme formulierbar, sofern Teilnahmeasymmetrien kompensiert werden (z. B. durch pfadspezifische Skalierung der Lernrate) und Vergessen durch geeignete Regularisierung kontrolliert wird.
 
-## Training (Pretraining and Instruction Tuning)
+6.2 Continuous Expandable Width (kontinuierliche Breiten-Erweiterung)
+Neue Pfade werden im laufenden Betrieb als zusätzliche Branches integriert, wobei eine konservative Gewichtsinjektion den Funktionssprung begrenzt; ein typisches Schema lautet mit Injektionsrate 
+β
+∈
+(
+0
+,
+1
+)
+β∈(0,1):
 
-The project distinguishes two training phases:
+bestehende Pfade: 
+α
+i
+′
+=
+(
+1
+−
+β
+)
+α
+i
+αi′​=(1−β)αi​
+neue Pfade (uniform): 
+α
+j
+′
+=
+β
+/
+M
+αj′​=β/M
+Die operative Zielsetzung besteht darin, neue Rechenressourcen unmittelbar in zusätzliche Modellkapazität zu überführen, ohne einen disruptiven Neustart der Gesamtarchitektur zu erzwingen.
 
-- Pretraining on generic texts
-- Instruction tuning on chat or dialogue data
+7. Implementationsumfang (Rust): Komponenten und Module
+Das Repository folgt einem „self-contained“-Ansatz und integriert die Kernbestandteile eines kompakten LLM-Stacks, wobei die MBT-Architektur als Erweiterungs- und Strukturprinzip über den Transformer-Layer gelegt wird.
 
-Both phases use the same training loop: the model is trained autoregressively for next-token prediction by deriving input tokens and target tokens from a token sequence shifted by one position. The loss is computed via cross-entropy, and gradients propagate backward through the layers via backpropagation.
+Typischerweise umfasst die Codebasis folgende Funktionsbereiche (die konkrete Dateistruktur kann projektspezifisch abweichen):
 
-Gradient clipping is applied to reduce numerical instability, particularly for small models and non-optimized initializations; in practice, this measure often contributes to stabilization (Pascanu, Mikolov, &amp; Bengio, 2013).
-
-## Inference (Greedy Decoding)
-
-Inference uses greedy decoding by computing softmax probabilities for the last token in the sequence and selecting the maximum until an EOS token is produced or `MAX_SEQ_LEN` is reached.
-
-This strategy is intentionally simple to ensure system completeness and traceability, although in production scenarios sampling methods such as top-k or nucleus sampling and temperature scaling typically yield better text quality (Holtzman et al., 2020).
-
-## Checkpoints (Save and Load with Rebuild)
-
-### Why Rebuild Is Required When Loading
-
-Because the output projection matrix has shape `[embedding_dim, vocab_size]`, `vocab_size` directly depends on the tokenizer vocabulary size. Consequently, a different tokenizer at load time inevitably leads to parameter mismatches.
-
-Therefore, the following procedure is used during loading via `Llm::load_checkpoint_rebuild`:
-
-1. Load and validate the checkpoint JSON
-2. Reconstruct the tokenizer from the checkpoint
-3. Rebuild the model (embeddings and output projection with `vocab_size` from the checkpoint)
-4. Apply the parameter vector to the newly created layers
-
-### Atomic Writes
-
-When saving, an atomic write strategy is used (temporary file, then rename) to prevent inconsistent checkpoints in the event of process termination or system issues&mdash;particularly relevant for long training runs and repeated saves.
-
-## Data Formats
-
-### JSON
-
-The current dataset logic expects, for JSON, a list of strings.
-
-Example `pretraining_data.json`:
-
-json
+Core-Layer/Model: Embeddings, Self-Attention, Feed-Forward, LayerNorm, Transformer-Block, Output Projection, sowie MBT-spezifische Branch- und Aggregationslogik.
+Tokenizer: Byte Pair Encoding (BPE) mit deterministischer Trainingskonfiguration.
+Training: autoregressives Next-Token-Training (Pretraining und Instruction-Tuning als Varianten desselben Loops), Optimizer (z. B. Adam) und numerische Stabilitätsmechanismen (z. B. Gradient Clipping).
+Inference: greedy decoding sowie optional temperature / top-k / top-p (abhängig vom Stand des Implementationsumfangs).
+Checkpoints: robustes Speichern/Laden inkl. Tokenizer- und Modellparametern in konsistentem Format, mit Fokus auf Reproduzierbarkeit und Formkompatibilität.
+8. Checkpoints und Determinismus: „Load with Rebuild“
+Ein zentraler Kompatibilitätsaspekt ergibt sich aus der Abhängigkeit der Output-Projektion von der Vokabulargröße (Shape: 
 [
-  &quot;Some training text.&quot;,
-  &quot;Another example sentence.&quot;
+d
+emb
+,
+∣
+V
+∣
 ]
+[demb​,∣V∣]); daher wird ein Verfahren eingesetzt, das beim Laden:
 
+Checkpoint validiert (Version/Magic),
+Tokenizer rekonstruiert,
+Modell anhand des im Checkpoint gespeicherten Vokabulars neu aufbaut,
+Parameter vektorbasiert einspielt.
+Dieses Vorgehen reduziert Shape-Mismatch-Risiken und unterstützt A/B-Vergleiche durch reproduzierbare Tokenizer-Konfigurationen.
 
-Example `chat_training_data.json`:
-
-json
-[
-  &quot;User: Hello Assistant: Hello, how can I help?&quot;,
-  &quot;User: Explain transformers. Assistant: ...&quot;
-]
-
-
-### CSV
-
-CSV is read without a header, and each line is concatenated into a string. This format should be understood more as a simple adapter than as a semantically structured chat representation.
-
-## Build and Run
-
-### Requirements
-
-- Rust stable toolchain
-- Cargo
-
-### Build
-
-bash
+9. Build, Run und Nutzung (CLI-orientiert)
+9.1 Voraussetzungen
+Rust stable toolchain
+Cargo
+9.2 Build
 cargo build --release
 
-
-### Run
-
-bash
+9.3 Run
 cargo run --release
 
+Je nach Implementationsstand stellt eine CLI typischerweise Funktionen bereit, die Training, Speichern, Laden sowie Prompt-basierte Inferenz unterstützen.
 
-The menu currently provides the following commands:
+10. Sicherheit und Robustheit (Systemperspektive)
+Für verteilte MBT-Setups gilt Sicherheit nicht als optionaler Zusatz, sondern als systemische Voraussetzung, da Branches als Angriffspunkte fungieren können (Byzantinische Outputs, Poisoning, Straggling/DoS). Wesentliche Schutzklassen umfassen:
 
-- `t` Train (pretraining and instruction tuning)
-- `s` Save checkpoint
-- `l` Load checkpoint (rebuild)
-- `a` Ask (enter a prompt, generate an answer)
-- `e` Exit
+Integrität von Modellartefakten (Hashing, Signaturen, Versionierung),
+Quorum-/Timeout-Policies gegen Tail-Latency und Straggling,
+Norm- und Gewichtskontrollen in der Aggregation,
+optional: Governance- und Audit-Schicht (z. B. Blockchain-basierte Registry/Attestation in erweiterten Zielarchitekturen).
+Die On-Chain-Ausführung des Modells ist dabei nicht zwingend, während eine Chain als manipulationsresistenter Ordnungsrahmen für Identität, Artefakt-Hashes, Update-Freigaben und Sanktionen dienen kann.
 
-## Security and Robustness
+11. Abgrenzung zu MoE / Switch / „Multi-Path“
+MBT unterscheidet sich konzeptionell und technisch von sparsely-gated MoE-Ansätzen und Switch-Transformern, die Breite primär als tokenweises Routing auf wenige aktivierte Expert*innen realisieren, während MBT Breite als gleichzeitig aktive Pfade pro Layer mit expliziter Aggregation definiert; zugleich unterscheidet sich MBT von „Multi-Path“-Interpretationen residualer Netze, weil Mehrpfadigkeit nicht bloß analytisch, sondern strukturell und orchestrationstauglich implementiert ist (Shazeer et al., 2017; Fedus et al., 2022; Veit et al., 2016).
 
-The project implements validations and defensive defaults in several places, including:
+12. Roadmap (technisch, erweiterungsorientiert)
+Je nach aktuellem Stand sind typische nächste Schritte:
 
-- Checkpoint validation via magic value and version
-- Parameter length checks when loading
-- Learning rate validation
-- Sequence length limiting
-- Atomic checkpoint saving
-- ASCII normalization to reduce Unicode edge cases
-
-At the same time, it should be noted that the system is intended as a research and development foundation rather than a production-ready LLM runtime, especially since sampling, efficient batching logic, mixed precision, KV cache, and formal test suites are not yet fully implemented.
-
-## Roadmap Toward a Complete LLM
-
-A complete LLM in terms of scalability, robust evaluation paths, and production-grade inference typically requires several technical extensions, which may be considered next steps for this repository:
-
-1. Tokenizer extensions
-   - Support for Unicode normalization and controlled byte fallbacks
-   - Consistent special tokens and clear prompt templates for chat
-2. Training infrastructure
-   - Mini-batches, shuffling, gradient accumulation
-   - Validation split, early stopping, and metrics
-   - Mixed precision and more stable initializations
-3. Inference quality
-   
-   - Repetition penalty and stopping criteria
-   - KV cache for efficient autoregression
-4. Model architecture
-   
-   - Positional embeddings or RoPE
-   - Attention mask handling for padding and batches
-5. Persistence and compatibility
-   - Explicit compatibility rules between checkpoint versions
-   - Optional sharding of large parameter vectors
-6. Testability and verification
-   - Unit tests for tokenizer, softmax stability, checkpoint roundtrip
-   - Golden tests for deterministic runs
+Effiziente Inferenz: KV-Cache, Batching, Maskierung, Mixed Precision.
+Verteilungsruntime: Branch-Discovery, Scheduling, Quorum-basierte Aggregation, Straggler-Management.
+Robuste Aggregation: Ausreißerresistenz, Reputations-/Trust-Gewichte, Mindestbeteiligungs-Governance.
+Continuous Learning Governance: Update-Validierung, Rollback, Poisoning-Detektion.
+Testbarkeit: Unit-Tests (Tokenizer, Softmax-Stabilität, Checkpoint-Roundtrip), deterministische Golden-Tests.
+13. Lizenz und Kontakt
+Lizenzinformationen sind dem Repository zu entnehmen.
+Kontakt und Projektbezug (gemäß den bereitgestellten Materialien): ms...@expchat.ai sowie die verlinkten GitHub-Projekte zur Rust-basierten LLM- und verteilten GPT-Node-Implementierung.
 
 
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. arXiv preprint arXiv:1701.06538.
 
-
-
+Veit, A., Wilber, M. J., & Belongie, S. (2016). Residual networks behave like ensembles of relatively shallow networks. In Advances in Neural Information Processing Systems.
