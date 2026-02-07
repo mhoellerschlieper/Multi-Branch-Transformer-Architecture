@@ -202,6 +202,8 @@ Holtzman, A., Buys, J., Du, L., Forbes, M., &amp; Choi, Y. (2020). The curious c
 
 Pascanu, R., Mikolov, T., &amp; Bengio, Y. (2013). On the difficulty of training recurrent neural networks. In *International Conference on Machine Learning*.
 
+Schlieper, M. (2026): Multi-Branch Transformer (MBT): Distributed Transformer Blocks and Topologies in Large Language Models as a Deep-Width-Learning Approach
+
 Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., &amp; Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. *arXiv preprint arXiv:1701.06538*.
 
 Veit, A., Wilber, M. J., &amp; Belongie, S. (2016). Residual networks behave like ensembles of relatively shallow networks. In *Advances in Neural Information Processing Systems*.
@@ -220,3 +222,4 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
