@@ -1,4 +1,4 @@
-# LLM (Rust) &mdash; Minimal Transformer with BPE Tokenizer, Training, and Checkpoints
+# MBT (Rust) &mdash; MBT - Multi Branch Transformer with BPE Tokenizer, Training, and Checkpoints
 
 This repository describes and implements a self-contained Large Language Model (LLM) in Rust, consisting of a compact Transformer architecture, a Byte Pair Encoding (BPE) tokenizer, a simple training loop for pretraining and instruction tuning, and a robust checkpoint format that consistently saves and loads both the tokenizer and model parameters.
 
@@ -194,6 +194,7 @@ A complete LLM in terms of scalability, robust evaluation paths, and production-
 6. Testability and verification
    - Unit tests for tokenizer, softmax stability, checkpoint roundtrip
    - Golden tests for deterministic runs
+
 
 
 
