@@ -183,6 +183,7 @@ fn main() {
         println!("  l Load checkpoint");
         println!("  s Save checkpoint");
         println!("  a Ask");
+        println!("  o Toggle outage simulation (test only)");
         println!("  e Exit");
         print!("\nEnter command: ");
         let _ = std::io::stdout().flush();
@@ -293,7 +294,17 @@ fn main() {
 
             continue;
         }
+        if s_cmd == "o" {
+            let b_new = !llm.is_outage_simulation_enabled();
+            llm.set_outage_simulation_enabled(b_new);
 
+            if b_new {
+                println!("Outage simulation: enabled");
+            } else {
+                println!("Outage simulation: disabled");
+            }
+            continue;
+        }
         if s_cmd == "a" {
              println!("Interactive mode. Type 'done' to exit.");
              loop {

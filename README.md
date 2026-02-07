@@ -1,199 +1,233 @@
-# MBT (Rust) &mdash; MBT - Multi Branch Transformer with BPE Tokenizer, Training, and Checkpoints
+# Multi-Branch-Transformer Architecture
 
-This repository describes and implements a self-contained Large Language Model (LLM) in Rust, consisting of a compact Transformer architecture, a Byte Pair Encoding (BPE) tokenizer, a simple training loop for pretraining and instruction tuning, and a robust checkpoint format that consistently saves and loads both the tokenizer and model parameters.
+Implementation and reference documentation of a **Multi-Branch Transformer Architecture (MBT)** in **Rust**. The focus is on **intra-layer parallelism (width)** with **explicit aggregation**, complemented by a **BPE tokenizer pipeline**, **training/inference**, and **reproducible checkpoints** (tokenizer + parameters) as a closed, analyzable system. The architecture is described to serve as a foundation for **distributed execution** (including P2P topologies) as well as for **fault-tolerant and continuously extensible** transformer systems.
 
-The project addresses the practical necessity of developing a complete LLM as a closed system in which data pipeline, tokenization, model, optimization, inference, and persistence are integrated into a reproducible workflow. It deliberately prioritizes a transparent implementation suitable for expert analysis, debugging, and incremental extension.
+<img width="448" height="692" alt="grafik" src="https://github.com/user-attachments/assets/1ae1d876-6ae2-4246-a80e-1578d7f74722" />
 
-Implemented features:
-- Temperature, top-k, top-p
-- Multi-head attention
-  
+
 ## Contents
-
-- Project overview
-- Architecture and components
-- Tokenizer (BPE) and determinism
-- Training (pretraining and instruction tuning)
-- Inference (greedy decoding)
-- Checkpoints (save and load with rebuild)
-- Data formats
-- Build and run
-- Security and robustness
-- Roadmap toward a complete LLM
-- License and contact
-
-## Project Overview
-
-The repository implements a compact Transformer pipeline comprising embeddings, multiple Transformer blocks (self-attention, feed-forward, layer normalization), and an output projection onto the token vocabulary. Tokenization is performed via a BPE tokenizer that is persisted in the checkpoint to ensure consistent vocabulary sizes and, consequently, consistent parameter shapes for the output projection.
-
-A central feature is checkpoint loading with rebuild: when loading, the model is rebuilt based on the tokenizer vocabulary stored in the checkpoint in order to avoid shape mismatches that would otherwise arise as soon as the vocabulary size differs between training and inference.
-
-## Architecture and Components
-
-The implementation is consolidated into a small number of modules and emphasizes self-contained executability.
-
-- `main.rs`
-  - CLI with menu loop
-  - Train, Save, Load, Ask
-  - Initial tokenizer training for immediate usability
-- `layer.rs`
-  - Core of the model (Layer trait, Embeddings, Self Attention, Feed Forward, LayerNorm, TransformerBlock, OutputProjection)
-  - Optimizer (Adam)
-  - Llm with Train, Predict, Save, and Load
-  - Checkpoint structure `LlmCheckpoint`
-- `tokenizer.rs`
-  - BPE training, encoding, decoding
-  - Deterministic training logic and reproducible configuration
-  - Tokenizer checkpoint structure `BpeTokenizerCheckpoint`
-- `train.rs`
-  - Dataset loader for JSON and CSV
-- `utils.rs`
-  - ASCII normalization and utility functions
-  - JSON serialization and atomic file writing
-- `math.rs`
-  - Softmax, cross-entropy, gradient computation, gradient clipping
-
-The default configuration (as of the current state) uses the following hyperparameters:
-
-- `MAX_SEQ_LEN = 80`
-- `EMBEDDING_DIM = 128`
-- `HIDDEN_DIM = 256`
-- 3 Transformer blocks
-- Output projection dimension: `vocab_size` from the tokenizer vocabulary
-
-## Tokenizer (BPE) and Determinism
-
-The BPE tokenizer is trained from the corpus and uses an ASCII-focused preprocessing pipeline that segments whitespace and conservatively separates punctuation to obtain a robust token structure for simple training data.
-
-Reproducibility is supported by a configuration object `BpeTokenizerConfig`, which is persisted in the checkpoint. This enables subsequent analysis of the tokenizer state and its training parameters&mdash;an important requirement for evaluation, debugging, and A/B comparisons (cf. Goodfellow, Bengio, &amp; Courville, 2016).
-
-## Training (Pretraining and Instruction Tuning)
-
-The project distinguishes two training phases:
-
-- Pretraining on generic texts
-- Instruction tuning on chat or dialogue data
-
-Both phases use the same training loop: the model is trained autoregressively for next-token prediction by deriving input tokens and target tokens from a token sequence shifted by one position. The loss is computed via cross-entropy, and gradients propagate backward through the layers via backpropagation.
-
-Gradient clipping is applied to reduce numerical instability, particularly for small models and non-optimized initializations; in practice, this measure often contributes to stabilization (Pascanu, Mikolov, &amp; Bengio, 2013).
-
-## Inference (Greedy Decoding)
-
-Inference uses greedy decoding by computing softmax probabilities for the last token in the sequence and selecting the maximum until an EOS token is produced or `MAX_SEQ_LEN` is reached.
-
-This strategy is intentionally simple to ensure system completeness and traceability, although in production scenarios sampling methods such as top-k or nucleus sampling and temperature scaling typically yield better text quality (Holtzman et al., 2020).
-
-## Checkpoints (Save and Load with Rebuild)
-
-### Why Rebuild Is Required When Loading
-
-Because the output projection matrix has shape `[embedding_dim, vocab_size]`, `vocab_size` directly depends on the tokenizer vocabulary size. Consequently, a different tokenizer at load time inevitably leads to parameter mismatches.
-
-Therefore, the following procedure is used during loading via `Llm::load_checkpoint_rebuild`:
-
-1. Load and validate the checkpoint JSON
-2. Reconstruct the tokenizer from the checkpoint
-3. Rebuild the model (embeddings and output projection with `vocab_size` from the checkpoint)
-4. Apply the parameter vector to the newly created layers
-
-### Atomic Writes
-
-When saving, an atomic write strategy is used (temporary file, then rename) to prevent inconsistent checkpoints in the event of process termination or system issues&mdash;particularly relevant for long training runs and repeated saves.
-
-## Data Formats
-
-### JSON
-
-The current dataset logic expects, for JSON, a list of strings.
-
-Example `pretraining_data.json`:
-
-json
-[
-  &quot;Some training text.&quot;,
-  &quot;Another example sentence.&quot;
-]
+- [Motivation and Objectives](#motivation-and-objectives)
+- [Core Idea: Multi-Branch Transformer (MBT)](#core-idea-multi-branch-transformer-mbt)
+- [Features](#features)
+- [Architecture Overview](#architecture-overview)
+- [Installation](#installation)
+- [Build and Run](#build-and-run)
+- [Usage (CLI)](#usage-cli)
+- [Training](#training)
+- [Inference](#inference)
+- [Checkpoints and Reproducibility](#checkpoints-and-reproducibility)
+- [Distributed Execution and Fault Tolerance (Concept)](#distributed-execution-and-fault-tolerance-concept)
+- [Security and Robustness (System Perspective)](#security-and-robustness-system-perspective)
+- [Distinction from MoE / Switch / Multi-Path](#distinction-from-moe--switch--multi-path)
+- [Roadmap](#roadmap)
+- [Citation](#citation)
+- [References (APA)](#references-apa)
+- [License](#license)
+- [Contact](#contact)
 
 
-Example `chat_training_data.json`:
 
-json
-[
-  &quot;User: Hello Assistant: Hello, how can I help?&quot;,
-  &quot;User: Explain transformers. Assistant: ...&quot;
-]
+In real inference deployments, large transformer models are often not primarily limited by compute operations, but by **memory footprint**, **memory bandwidth** and **communication and synchronization costs** in distributed environments. Classical partitioning along **depth** does reduce memory requirements per node, but it still enforces a **sequential token-processing chain**, leaving potential parallelism gains structurally underutilized&mdash;particularly in **heterogeneous** and **volatile** execution environments.
+
+This repository addresses this situation via a **multi-branch topology** in which parallelism is organized as a **width structure within a layer**: multiple transformer blocks or block sequences are executed **concurrently**, and their path outputs are subsequently fused through an **aggregation stage**, which simultaneously provides a natural **partitioning and orchestration unit** for distributed resources.
+
+---
+
+## Core Idea: Multi-Branch Transformer (MBT)
+
+<img width="1226" height="120" alt="grafik" src="https://github.com/user-attachments/assets/811bf50f-780e-4d40-abf4-2083bc8ae2fb" />
 
 
-### CSV
+This aggregation functions as a central system component because it structurally enables **fusion**, **weighting**, **failure handling** (masking/renormalization), and **governance rules** against path impoverishment and weight collapse.
 
-CSV is read without a header, and each line is concatenated into a string. This format should be understood more as a simple adapter than as a semantically structured chat representation.
+---
+Result Metrics:
+
+<img width="1228" height="745" alt="grafik" src="https://github.com/user-attachments/assets/2d224c94-1aac-449e-804b-0a957b6774b9" />
+
+---
+
+## Features
+
+- **Multi-Branch Transformer Layer** (width parallelism with aggregation)
+- **BPE tokenizer** with persisted configuration for deterministic reconstruction
+- **Training loop** for autoregressive next-token training (pretraining and instruction tuning as variants)
+- **Inference** (greedy decoding; depending on status optionally temperature / top-k / top-p)
+- **Checkpointing**: saving and loading tokenizer + model parameters
+- **Load with Rebuild**: reconstructing the model based on the vocabulary size stored in the checkpoint to prevent shape mismatches
+- **Robustness mechanisms** (including validations, parameter-length checks, atomic writes; depending on implementation status)
+
+---
+
+## Architecture Overview
+
+The codebase follows a &ldquo;self-contained&rdquo; approach in which tokenization, model, training, inference, and persistence are integrated into a traceable workflow. Typical components include:
+
+- **Tokenizer**: BPE training, encode/decode, persisted tokenizer configuration
+- **Model core**: embeddings, self-attention, feed-forward, layer norm, transformer blocks
+- **MBT extension**: parallel branches per layer and aggregation logic
+- **Optimization**: e.g., Adam; optional gradient clipping
+- **Persistence**: checkpoint format with versioning/magic value and atomic writing
+
+Note: Concrete module and file names depend on the current state of the repository; the README describes the target design consistently with the provided textual foundations.
+
+---
+
+## Installation
+
+Requirements:
+- Rust (stable)
+- Cargo
+
+Optional (recommended for development):
+- `rustfmt`
+- `clippy`
+
+---
 
 ## Build and Run
 
-### Requirements
+Build (release):
+- `cargo build --release`
 
-- Rust stable toolchain
-- Cargo
+Run:
+- `cargo run --release`
 
-### Build
+---
 
-bash
-cargo build --release
+## Usage (CLI)
+
+The project is typically CLI-oriented and provides (depending on status) the following flows:
+- start training (pretraining / instruction tuning)
+- save checkpoint
+- load checkpoint (including rebuild)
+- enter a prompt and generate a response
+
+Concrete commands, flags, and menu entries should be checked in `main.rs` or the respective CLI definition.
+
+---
+
+## Training
+
+Training follows the autoregressive next-token scheme: input tokens and target tokens are created by shifting the sequence by 1, the loss is computed via cross-entropy, and gradients are propagated by backpropagation. In the MBT variant, it is additionally relevant that the **width paths** are trained fairly and stably to prevent **path impoverishment**, because otherwise redundant paths do not provide functional substitutability in the event of failure.
+
+Depending on configuration, the following aspects are central:
+- sequence-length limitation (e.g., `MAX_SEQ_LEN`)
+- (optional) gradient clipping to stabilize small, non-optimized implementations (Pascanu et al., 2013)
+- (optional) mini-batching/gradient accumulation (roadmap, if not yet implemented)
+
+---
+
+## Inference
+
+Inference in the simplest mode uses **greedy decoding**: the most likely next token is iteratively selected until EOS is reached or the maximum sequence length applies. Sampling methods such as temperature / top-k / top-p may be added or already present depending on implementation status; in the literature they are considered practically relevant for text quality (Holtzman et al., 2020).
+
+---
+
+## Checkpoints and Reproducibility
+
+### Why &ldquo;Load with Rebuild&rdquo; Is Required
+
+The output projection typically has shape \([d_{\text{emb}}, |V|]\), where \(|V|\) depends directly on the tokenizer vocabulary size. If a tokenizer with a different vocabulary size is used when loading, shape mismatches occur.
+
+Therefore, when loading, the system (conceptually) implements the following steps:
+1. load and validate checkpoint (magic/version)
+2. reconstruct tokenizer from checkpoint
+3. **rebuild** the model based on \(|V|\) from the checkpoint
+4. load the parameter vector and check length/shape
+
+### Atomic Writes
+
+When saving, an atomic write strategy (temporary file + rename) is used to avoid inconsistent checkpoints in the event of interruption or system faults.
+
+---
+
+## Distributed Execution and Fault Tolerance (Concept)
+
+The multi-branch structure is modeled such that **one path** can serve as a **partition unit** mapped to different nodes, while an aggregation instance fuses the path outputs. For fault tolerance, a masking variable \(m_i^{(l)} \in \{0,1\}\) is used; weights are renormalized in the event of failure:
+
+\[
+\tilde{\alpha}_i^{(l)} = \frac{m_i^{(l)} \alpha_i^{(l)}}{\sum_{j=1}^{K} m_j^{(l)} \alpha_j^{(l)}} \quad (\text{if denominator} &gt; 0),
+\quad
+\tilde{h}^{(l+1)} = \sum_{i=1}^{K} \tilde{\alpha}_i^{(l)} z_i^{(l)}.
+\]
+
+Thus, the layer function remains well-defined as long as at least one path is available. In P2P settings, quorum/timeout policies and anti-weight-collapse rules are methodologically central to limit tail latency and single-point-of-failure effects.
+
+---
+
+## Security and Robustness (System Perspective)
+
+In open or semi-open distributed environments, parallel paths increase the attack surface (Byzantine outputs, straggling/DoS, update poisoning). An MBT system therefore typically requires:
+- integrity of model artifacts (hashes/signatures/versioning)
+- quorum/timeout policies against straggler tail latency
+- norm and weight controls in the aggregation
+- (optional) admission control for new paths under &ldquo;continuous expandable width&rdquo;
+
+A blockchain can conceptually serve as a governance and audit layer, but it is not intended as the model&rsquo;s execution environment; rather, it acts as a root of trust for identity, artifact hashes, and update approvals.
+
+---
+
+## Distinction from MoE / Switch / Multi-Path
+
+- **MoE/Switch**: width is primarily realized via **sparse, token-wise routing** to a small number of experts; the goal is parameter scaling with limited compute per token (Shazeer et al., 2017; Fedus et al., 2022).
+- **Multi-Path (residual interpretation)**: describes multi-path behavior more analytically than as an explicit, orchestratable parallel structure (Veit et al., 2016).
+- **MBT**: defines multi-pathness as **simultaneously active paths per layer** with **explicit aggregation**, thereby systematically addressing distributability, robustness, and continuous extensibility.
+
+---
+
+## Roadmap
+
+Possible next steps (depending on current status):
+- **Efficient inference**: KV cache, batching, masking, mixed precision
+- **Distribution runtime**: branch discovery, scheduling, quorum-based aggregation, straggler management
+- **Robust aggregation**: trimmed mean / median-of-means, reputation weights, anti-impoverishment governance
+- **Continuous learning governance**: update validation, rollback, poisoning detection
+- **Tests**: tokenizer determinism, softmax stability, checkpoint round-trip, golden tests
+
+---
+
+## Citation
+
+If content from the project is cited, a reference to this repository and to the sources mentioned in the project context is recommended (see below).
+
+---
+
+## References (APA)
+
+Dean, J., Corrado, G., Monga, R., Chen, K., Devin, M., Le, Q. V., Mao, M. Z., Ranzato, M., Senior, A., Tucker, P., Yang, K., &amp; Ng, A. Y. (2012). Large scale distributed deep networks. In *Advances in Neural Information Processing Systems*.
+
+Fedus, W., Zoph, B., &amp; Shazeer, N. (2022). Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. *Journal of Machine Learning Research, 23*(120), 1&ndash;39.
+
+Goodfellow, I., Bengio, Y., &amp; Courville, A. (2016). *Deep learning*. MIT Press.
+
+Holtzman, A., Buys, J., Du, L., Forbes, M., &amp; Choi, Y. (2020). The curious case of neural text degeneration. In *International Conference on Learning Representations*.
+
+Pascanu, R., Mikolov, T., &amp; Bengio, Y. (2013). On the difficulty of training recurrent neural networks. In *International Conference on Machine Learning*.
+
+Schlieper, M. (2026): Multi-Branch Transformer (MBT): Distributed Transformer Blocks and Topologies in Large Language Models as a Deep-Width-Learning Approach
+
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., &amp; Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. *arXiv preprint arXiv:1701.06538*.
+
+Veit, A., Wilber, M. J., &amp; Belongie, S. (2016). Residual networks behave like ensembles of relatively shallow networks. In *Advances in Neural Information Processing Systems*.
+
+---
+
+## License
+
+See `LICENSE` in the repository.
+
+---
+
+## Contact
+
+- Contact: mschlieper@expchat.ai
+- Related implementations/references (project environment):
+  - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
+  - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
 
 
-### Run
 
-bash
-cargo run --release
-
-
-The menu currently provides the following commands:
-
-- `t` Train (pretraining and instruction tuning)
-- `s` Save checkpoint
-- `l` Load checkpoint (rebuild)
-- `a` Ask (enter a prompt, generate an answer)
-- `e` Exit
-
-## Security and Robustness
-
-The project implements validations and defensive defaults in several places, including:
-
-- Checkpoint validation via magic value and version
-- Parameter length checks when loading
-- Learning rate validation
-- Sequence length limiting
-- Atomic checkpoint saving
-- ASCII normalization to reduce Unicode edge cases
-
-At the same time, it should be noted that the system is intended as a research and development foundation rather than a production-ready LLM runtime, especially since sampling, efficient batching logic, mixed precision, KV cache, and formal test suites are not yet fully implemented.
-
-## Roadmap Toward a Complete LLM
-
-A complete LLM in terms of scalability, robust evaluation paths, and production-grade inference typically requires several technical extensions, which may be considered next steps for this repository:
-
-1. Tokenizer extensions
-   - Support for Unicode normalization and controlled byte fallbacks
-   - Consistent special tokens and clear prompt templates for chat
-2. Training infrastructure
-   - Mini-batches, shuffling, gradient accumulation
-   - Validation split, early stopping, and metrics
-   - Mixed precision and more stable initializations
-3. Inference quality
-   
-   - Repetition penalty and stopping criteria
-   - KV cache for efficient autoregression
-4. Model architecture
-   
-   - Positional embeddings or RoPE
-   - Attention mask handling for padding and batches
-5. Persistence and compatibility
-   - Explicit compatibility rules between checkpoint versions
-   - Optional sharding of large parameter vectors
-6. Testability and verification
-   - Unit tests for tokenizer, softmax stability, checkpoint roundtrip
-   - Golden tests for deterministic runs
 
 
 
