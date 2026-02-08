@@ -2537,8 +2537,8 @@ impl Llm {
         }
 
         llm.assign_all_parameters_flat(&cp.v_params)?;
-        llm.run_post_load_mtb_diagnostics_ascii();
-
+        //llm.run_post_load_mtb_diagnostics_ascii();
+        
         Ok(llm)
     }
 

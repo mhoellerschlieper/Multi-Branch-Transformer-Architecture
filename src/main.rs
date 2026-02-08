@@ -3,16 +3,15 @@
 //              supports checkpoint save and load.
 //
 //              Extension:
-//              - After each Ask/predict, print runtime metrics:
-//                duration, token_count, tokens_per_sec, and 5 additional metrics.
+//              - Add command z to run an A B benchmark over 10 fixed prompts:
+//                (A) outage_simulation=false, predict_with_stats, aggregate mean metrics
+//                (B) outage_simulation=true,  predict_with_stats, aggregate mean metrics
 //
 // History:
 // - 2026-02-01: Add menu loop and checkpoint save and load.
-// - 2026-02-01: Fix checkpoint load by rebuilding model from checkpoint tokenizer vocab.
 // - 2026-02-07: Add MTB parallel block group layer to support multi branch topology.
-// - 2026-02-07: Add TransformerSequence and generalize ParallelBlockGroup to accept Layer branches.
-// - 2026-02-08: Add menu commands T (topology) and M (metrics) to main loop.
-// - 2026-02-08: Add post predict metrics: duration, token count, tokens/sec, plus 5 extra metrics.
+// - 2026-02-08: Add predict_with_stats and post predict metrics.
+// - 2026-02-08: Add command z to compute mean metrics with outage simulation off and on.
 // Author: Marcus Schlieper
 
 mod layer;
@@ -25,8 +24,8 @@ use std::io::Write;
 use std::time::Instant;
 
 use crate::layer::{
-    Embeddings, Layer, Llm, OutputProjection, ParallelBlockGroup, TransformerBlock,
-    TransformerSequence, PredictStats
+    Embeddings, Layer, Llm, OutputProjection, ParallelBlockGroup, PredictStats, TransformerBlock,
+    TransformerSequence,
 };
 use crate::tokenizer::{BpeTokenizer, BpeTokenizerConfig};
 use crate::train::{Dataset, DatasetType};
@@ -102,7 +101,7 @@ fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
 // ASCII topology rendering for the current in-memory network.
 fn topology_to_ascii_lines(llm: &mut Llm) -> Vec<String> {
     // History:
-    // - 2026-02-08: Add ASCII topology report for menu command T.
+    // - 2026-02-08: Add ASCII topology report for menu command y.
     let mut v_out: Vec<String> = Vec::new();
 
     v_out.push("=== Model Topology (ASCII) ===".to_string());
@@ -119,10 +118,7 @@ fn topology_to_ascii_lines(llm: &mut Llm) -> Vec<String> {
         let s_t = layer.layer_type().to_string();
 
         if s_t == "ParallelBlockGroup" {
-            let opt_pg = layer
-                .as_any_mut()
-                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
-
+            let opt_pg = layer.as_any_mut().and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
             if let Some(pg) = opt_pg {
                 v_out.push(format!(
                     "[{}] ParallelBlockGroup branches={}",
@@ -130,8 +126,7 @@ fn topology_to_ascii_lines(llm: &mut Llm) -> Vec<String> {
                     pg.num_branches()
                 ));
 
-                // NOTE: v_branches is private. This requires a public helper in layer.rs:
-                // ParallelBlockGroup::branch_layer_types_ascii()
+                // NOTE: Branch list is accessed via public helper (encapsulation).
                 let v_branch_types = pg.branch_layer_types_ascii();
                 for (i_b, s_bt) in v_branch_types.iter().enumerate() {
                     v_out.push(format!("  - branch[{}] {}", i_b, s_bt));
@@ -139,7 +134,10 @@ fn topology_to_ascii_lines(llm: &mut Llm) -> Vec<String> {
                 continue;
             }
 
-            v_out.push(format!("[{}] ParallelBlockGroup (downcast_failed)", i_idx));
+            v_out.push(format!(
+                "[{}] ParallelBlockGroup (downcast_failed)",
+                i_idx
+            ));
             continue;
         }
 
@@ -154,6 +152,38 @@ fn topology_to_ascii_lines(llm: &mut Llm) -> Vec<String> {
     v_out
 }
 
+// Print MTB metrics and an ASCII report (manual trigger).
+fn print_metrics_ascii(llm: &mut Llm) {
+    // History:
+    // - 2026-02-08: Add menu command x to print MTB diagnostics.
+    println!();
+    println!("=== Metrics (MTB diagnostics) ===");
+    llm.run_post_load_mtb_diagnostics_ascii();
+}
+
+// Post predict runtime metrics (single run).
+#[derive(Clone, Debug)]
+struct predict_metrics_ascii {
+    // Runtime / throughput.
+    d_duration_ms: f64,
+    i_generated_tokens: usize,
+    d_tokens_per_sec: f64,
+
+    // Token / text.
+    i_input_tokens: usize,
+    i_total_tokens: usize,
+    i_output_chars: usize,
+    d_avg_chars_per_token_out: f64,
+    d_output_chars_per_sec: f64,
+    d_effective_context_utilization: f64,
+
+    // Prediction quality proxies from PredictStats.
+    d_avg_selected_token_prob: f64,
+    d_perplexity_selected: f64,
+    d_avg_next_token_entropy_nat: f64,
+    d_avg_top1_top2_margin: f64,
+    i_pred_stats_steps: usize,
+}
 
 fn clamp_f64(d_x: f64, d_min: f64, d_max: f64) -> f64 {
     if !d_x.is_finite() {
@@ -166,29 +196,6 @@ fn clamp_f64(d_x: f64, d_min: f64, d_max: f64) -> f64 {
     } else {
         d_x
     }
-}
-
-#[derive(Clone, Debug)]
-struct predict_metrics_ascii {
-    // Primary metrics requested.
-    d_duration_ms: f64,
-    i_generated_tokens: usize,
-    d_tokens_per_sec: f64,
-
-    // Additional runtime/text metrics.
-    i_input_tokens: usize,
-    i_total_tokens: usize,
-    i_output_chars: usize,
-    d_avg_chars_per_token_out: f64,
-    d_output_chars_per_sec: f64,
-    d_effective_context_utilization: f64,
-
-    // Prediction related metrics (new).
-    d_avg_selected_token_prob: f64,
-    d_perplexity_selected: f64,
-    d_avg_next_token_entropy_nat: f64,
-    d_avg_top1_top2_margin: f64,
-    i_pred_stats_steps: usize,
 }
 
 fn compute_predict_metrics_ascii(
@@ -213,6 +220,7 @@ fn compute_predict_metrics_ascii(
     };
     let d_output_chars_per_sec = (i_output_chars as f64) / d_sec;
 
+    // Effective context utilization indicates proximity to MAX_SEQ_LEN and truncation risk.
     let d_effective_context_utilization =
         (i_total_tokens as f64) / (crate::MAX_SEQ_LEN as f64).max(1.0);
 
@@ -275,15 +283,142 @@ fn print_predict_metrics_ascii(m: &predict_metrics_ascii) {
     println!("pred_stats_steps: {}", m.i_pred_stats_steps);
 }
 
-// Run MTB metrics and print an ASCII report.
-// This reuses layer.rs implementation by calling the post-load diagnostics routine.
-// NOTE: It prints only if ParallelBlockGroup exists and valid diagnostic samples can be built.
-fn print_metrics_ascii(llm: &mut Llm) {
+// Mean aggregation for command z (10 prompts).
+#[derive(Clone, Debug)]
+struct predict_metrics_mean_agg_ascii {
+    i_runs_total: usize,
+    i_runs_ok: usize,
+
+    d_duration_ms_mean: f64,
+    d_generated_tokens_mean: f64,
+    d_tokens_per_sec_mean: f64,
+
+    d_avg_selected_token_prob_mean: f64,
+    d_perplexity_selected_mean: f64,
+    d_avg_next_token_entropy_nat_mean: f64,
+    d_avg_top1_top2_margin_mean: f64,
+
+    d_effective_context_utilization_mean: f64,
+}
+
+fn mean_safe_f64(v_x: &[f64]) -> f64 {
+    if v_x.is_empty() {
+        return 0.0;
+    }
+    let mut d_sum: f64 = 0.0;
+    let mut d_cnt: f64 = 0.0;
+    for &d in v_x.iter() {
+        if d.is_finite() {
+            d_sum += d;
+            d_cnt += 1.0;
+        }
+    }
+    if d_cnt <= 0.0 {
+        0.0
+    } else {
+        d_sum / d_cnt
+    }
+}
+
+fn run_predict_mean_benchmark_ascii(
+    llm: &mut Llm,
+    v_prompts: &[String],
+    i_limit: usize,
+) -> predict_metrics_mean_agg_ascii {
     // History:
-    // - 2026-02-08: Add menu command M to print MTB diagnostics.
-    println!("");
-    println!("=== Metrics (MTB diagnostics) ===");
-    llm.run_post_load_mtb_diagnostics_ascii();
+    // - 2026-02-08: Add command z mean benchmark runner (A/B outage simulation).
+    let i_take = i_limit.min(v_prompts.len());
+    let mut i_runs_total: usize = 0;
+    let mut i_runs_ok: usize = 0;
+
+    let mut v_duration_ms: Vec<f64> = Vec::new();
+    let mut v_generated_tokens: Vec<f64> = Vec::new();
+    let mut v_tokens_per_sec: Vec<f64> = Vec::new();
+
+    let mut v_avg_p: Vec<f64> = Vec::new();
+    let mut v_ppl: Vec<f64> = Vec::new();
+    let mut v_entropy: Vec<f64> = Vec::new();
+    let mut v_margin: Vec<f64> = Vec::new();
+    let mut v_ctx_util: Vec<f64> = Vec::new();
+
+    for s_prompt in v_prompts.iter().take(i_take) {
+        i_runs_total = i_runs_total.saturating_add(1);
+
+        let t0 = Instant::now();
+        let r = llm.predict_with_stats(s_prompt);
+        let d_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        match r {
+            Ok((s_out, st)) => {
+                i_runs_ok = i_runs_ok.saturating_add(1);
+                let m = compute_predict_metrics_ascii(llm, s_prompt, &s_out, d_ms, Some(&st));
+
+                v_duration_ms.push(m.d_duration_ms);
+                v_generated_tokens.push(m.i_generated_tokens as f64);
+                v_tokens_per_sec.push(m.d_tokens_per_sec);
+
+                v_avg_p.push(m.d_avg_selected_token_prob);
+                v_ppl.push(m.d_perplexity_selected);
+                v_entropy.push(m.d_avg_next_token_entropy_nat);
+                v_margin.push(m.d_avg_top1_top2_margin);
+                v_ctx_util.push(m.d_effective_context_utilization);
+            }
+            Err(_) => {
+                // On error, skip from mean to avoid skewing with zeros.
+                // This is intentionally strict for expert diagnostics.
+                continue;
+            }
+        }
+    }
+
+    predict_metrics_mean_agg_ascii {
+        i_runs_total,
+        i_runs_ok,
+
+        d_duration_ms_mean: mean_safe_f64(&v_duration_ms),
+        d_generated_tokens_mean: mean_safe_f64(&v_generated_tokens),
+        d_tokens_per_sec_mean: mean_safe_f64(&v_tokens_per_sec),
+
+        d_avg_selected_token_prob_mean: mean_safe_f64(&v_avg_p),
+        d_perplexity_selected_mean: mean_safe_f64(&v_ppl),
+        d_avg_next_token_entropy_nat_mean: mean_safe_f64(&v_entropy),
+        d_avg_top1_top2_margin_mean: mean_safe_f64(&v_margin),
+
+        d_effective_context_utilization_mean: mean_safe_f64(&v_ctx_util),
+    }
+}
+
+fn print_mean_benchmark_report_ascii(s_title: &str, agg: &predict_metrics_mean_agg_ascii) {
+    println!();
+    println!("=== Mean Benchmark Report ===");
+    println!("title: {}", s_title);
+    println!("runs_total: {}", agg.i_runs_total);
+    println!("runs_ok: {}", agg.i_runs_ok);
+
+    println!("duration_ms_mean: {:.6}", agg.d_duration_ms_mean);
+    println!("generated_tokens_mean: {:.6}", agg.d_generated_tokens_mean);
+    println!("tokens_per_sec_mean: {:.6}", agg.d_tokens_per_sec_mean);
+
+    println!(
+        "avg_selected_token_prob_mean: {:.6}",
+        agg.d_avg_selected_token_prob_mean
+    );
+    println!(
+        "perplexity_selected_mean: {:.6}",
+        agg.d_perplexity_selected_mean
+    );
+    println!(
+        "avg_next_token_entropy_nat_mean: {:.6}",
+        agg.d_avg_next_token_entropy_nat_mean
+    );
+    println!(
+        "avg_top1_top2_margin_mean: {:.6}",
+        agg.d_avg_top1_top2_margin_mean
+    );
+    println!(
+        "effective_context_utilization_mean: {:.6}",
+        agg.d_effective_context_utilization_mean
+    );
 }
 
 fn main() {
@@ -295,6 +430,7 @@ fn main() {
         DatasetType::JSON,
     );
 
+    // Keep initial tokenizer training to allow immediate usage.
     let mut v_corpus: Vec<String> = Vec::new();
     v_corpus.extend(dataset.pretraining_data.clone());
     v_corpus.extend(dataset.chat_training_data.clone());
@@ -322,7 +458,6 @@ fn main() {
     println!("Total parameters: {}", llm.total_parameters());
 
     loop {
-        println!("\n");
         println!("\n--- Menu Mode ---");
         println!("Commands:");
         println!("  t Train");
@@ -332,6 +467,7 @@ fn main() {
         println!("  o Toggle outage simulation (test only)");
         println!("  y Topology (ASCII)");
         println!("  x Metrics (MTB diagnostics)");
+        println!("  z Mean benchmark (10 prompts, outage off/on)");
         println!("  e Exit");
         print!("\nEnter command: ");
         let _ = std::io::stdout().flush();
@@ -344,6 +480,7 @@ fn main() {
             }
         };
 
+        // Normalize once. From here on, only compare s_cmd_lc.
         let s_cmd_lc = s_cmd.to_lowercase();
 
         if s_cmd_lc == "e" {
@@ -364,21 +501,15 @@ fn main() {
                 .map(|s| s.as_str())
                 .collect();
 
-            let pretrain_epochs = 30;
-            let pretrain_learn_rate = 0.0005;
-
-            let train_epochs = 50;
-            let train_learn_rate = 0.0001;
-
             println!("\n=== PRE-TRAINING MODEL ===");
             println!(
                 "Pre-training on {} examples for {} epochs with learning rate {}",
                 dataset.pretraining_data.len(),
-                pretrain_epochs,
-                pretrain_learn_rate
+                100,
+                0.0005
             );
 
-            if let Err(e) = llm.train(v_pretraining_examples, pretrain_epochs, pretrain_learn_rate) {
+            if let Err(e) = llm.train(v_pretraining_examples, 30, 0.0005) {
                 eprintln!("Training failed: {}", e);
                 continue;
             }
@@ -387,11 +518,11 @@ fn main() {
             println!(
                 "Instruction tuning on {} examples for {} epochs with learning rate {}",
                 dataset.chat_training_data.len(),
-                train_epochs,
-                train_learn_rate
+                200,
+                0.0001
             );
 
-            if let Err(e) = llm.train(v_chat_training_examples, train_epochs, train_learn_rate) {
+            if let Err(e) = llm.train(v_chat_training_examples, 50, 0.0001) {
                 eprintln!("Training failed: {}", e);
                 continue;
             }
@@ -439,6 +570,7 @@ fn main() {
                 s_checkpoint_path = s_path;
             }
 
+            // IMPORTANT: Rebuild model to match checkpoint tokenizer and vocab size.
             match Llm::load_checkpoint_llm_checkpoint_v2_rebuild(&s_checkpoint_path) {
                 Ok(llm_loaded) => {
                     llm = llm_loaded;
@@ -459,28 +591,64 @@ fn main() {
             } else {
                 println!("Outage simulation: disabled");
             }
-
             continue;
         }
 
-        if s_cmd == "y" {
+        if s_cmd_lc == "y" {
             let v_lines = topology_to_ascii_lines(&mut llm);
-            println!("");
+            println!();
             for s_line in v_lines {
                 println!("{}", s_line);
             }
             continue;
         }
 
-        if s_cmd == "x" {
+        if s_cmd_lc == "x" {
             print_metrics_ascii(&mut llm);
+            continue;
+        }
+
+        if s_cmd_lc == "z" {
+            // Fixed prompt set for a stable A/B comparison (ASCII only prompts by convention).
+            // If desired, this can be extended to include UTF-8 prompts as well.
+            let v_prompts: Vec<String> = vec![
+                "User: Wo liegt der Mount Everest?".to_string(),
+                "User: was ist der  Mount everest".to_string(),
+                "User: What is gradient clipping?".to_string(),
+                "User: In welchem Gebirge befindet sich der Mount Everest?".to_string(),
+                "User: Was ist der Amazonas-Regenwald?".to_string(),
+                "User: Wie lange braucht der Mond fuer eine Umrundung der Erde?".to_string(),
+                "User: Was ist Schall?".to_string(),
+                "User: Wie ist Jupiter?".to_string(),
+                "User: Was bedeckt den groessten Teil der Erde?".to_string(),
+                "User: Wie wird Schokolade hergestellt?".to_string(),
+            ];
+
+            println!();
+            println!("=== Mean benchmark start ===");
+            println!("prompts: {}", v_prompts.len());
+
+            // Phase A: outage simulation disabled.
+            llm.set_outage_simulation_enabled(false);
+            let agg_off = run_predict_mean_benchmark_ascii(&mut llm, &v_prompts, 10);
+            print_mean_benchmark_report_ascii("outage_simulation=false", &agg_off);
+
+            // Phase B: outage simulation enabled.
+            llm.set_outage_simulation_enabled(true);
+            let agg_on = run_predict_mean_benchmark_ascii(&mut llm, &v_prompts, 10);
+            print_mean_benchmark_report_ascii("outage_simulation=true", &agg_on);
+
+            // Restore default: keep previous behavior conservative (disabled).
+            llm.set_outage_simulation_enabled(false);
+
+            println!();
+            println!("=== Mean benchmark end ===");
             continue;
         }
 
         if s_cmd_lc == "a" {
             println!("Interactive mode. Type 'done' to exit.");
             loop {
-                println!("\n");
                 print!("Enter prompt: ");
                 let _ = std::io::stdout().flush();
 
@@ -496,13 +664,13 @@ fn main() {
                     println!("Empty prompt.");
                     continue;
                 }
-
                 if s_user.eq_ignore_ascii_case("done") {
                     break;
                 }
 
                 let s_formatted = format!("User: {}", s_user);
 
+                // Metrics timing starts immediately before predict.
                 let t0 = Instant::now();
                 let r_predict = llm.predict_with_stats(&s_formatted);
                 let d_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -510,13 +678,17 @@ fn main() {
                 match r_predict {
                     Ok((s_out, st)) => {
                         println!("Model output: {}", s_out);
-
-                        let m = compute_predict_metrics_ascii(&llm, &s_formatted, &s_out, d_ms, Some(&st));
+                        let m = compute_predict_metrics_ascii(
+                            &llm,
+                            &s_formatted,
+                            &s_out,
+                            d_ms,
+                            Some(&st),
+                        );
                         print_predict_metrics_ascii(&m);
                     }
                     Err(e) => {
                         println!("Model output error: {}", e);
-
                         let m = compute_predict_metrics_ascii(&llm, &s_formatted, "", d_ms, None);
                         print_predict_metrics_ascii(&m);
                     }
