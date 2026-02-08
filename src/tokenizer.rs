@@ -1,23 +1,24 @@
 // tokenizer.rs
 // Description: Byte Pair Encoding (BPE) tokenizer including training, encoding, decoding,
 //              plus serialization support for checkpoint save and load.
-//              Improvements:
-//              - Stable, explicit special tokens (no empty strings).
-//              - Improved ASCII pre-tokenization (punctuation separation).
-//              - Deterministic tokenizer training via explicit seed and stored config.
+//
+//              UTF-8 extension:
+//              - Replace ASCII-only pre-tokenization with UTF-8 aware pre-tokenizer.
+//              - Remove non-ASCII replacement by UNK.
+//              - Keep determinism via explicit normalization and stable sorting.
+//
 // History:
 // - 2026-02-01: Consolidate tokenizer and vocab related logic into tokenizer.rs and layer.rs.
 // - 2026-02-01: Add checkpoint serialization for tokenizer (vocab and merges).
 // - 2026-02-01: Implement stable special tokens, improved pre-tokenization, and deterministic training.
+// - 2026-02-08: Implement UTF-8 aware pre-tokenization and decoding normalization.
 // Author: Marcus Schlieper
 
 use std::collections::{HashMap, HashSet};
 
 use crate::layer::Vocab;
 use crate::utils;
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 // Special tokens. Keep stable and ASCII.
 // NOTE: Must be unique and non-empty to avoid collisions in vocab encoding and decoding.
@@ -37,6 +38,9 @@ pub struct BpeTokenizerConfig {
     pub i_min_pair_count: usize,
     pub u64_seed: u64,
     pub s_pre_tokenizer: String,
+    // UTF-8 normalization mode, stored to ensure deterministic behavior across runs.
+    // Supported: "none", "nfc"
+    pub s_unicode_normalization: String,
 }
 
 impl Default for BpeTokenizerConfig {
@@ -45,7 +49,9 @@ impl Default for BpeTokenizerConfig {
             i_vocab_target: 2000,
             i_min_pair_count: 2,
             u64_seed: 123456789,
-            s_pre_tokenizer: "ascii_ws_punct_v1".to_string(),
+            // Switch default to UTF-8 aware tokenizer while keeping name explicit.
+            s_pre_tokenizer: "utf8_ws_punct_v1".to_string(),
+            s_unicode_normalization: "nfc".to_string(),
         }
     }
 }
@@ -81,13 +87,18 @@ impl BpeTokenizer {
         }
 
         // Validate special tokens exist and are unique.
-        // This prevents ambiguous encoding and decoding behavior.
         for s_tok in [S_PAD, S_UNK, S_BOS, S_EOS] {
             if vocab.encode(s_tok).is_none() {
                 return Err(format!("missing_special_token_in_vocab: {}", s_tok));
             }
         }
-        if S_PAD == S_UNK || S_PAD == S_BOS || S_PAD == S_EOS || S_UNK == S_BOS || S_UNK == S_EOS || S_BOS == S_EOS {
+        if S_PAD == S_UNK
+            || S_PAD == S_BOS
+            || S_PAD == S_EOS
+            || S_UNK == S_BOS
+            || S_UNK == S_EOS
+            || S_BOS == S_EOS
+        {
             return Err("special_tokens_not_unique".to_string());
         }
         if S_PAD.is_empty() || S_UNK.is_empty() || S_BOS.is_empty() || S_EOS.is_empty() {
@@ -119,45 +130,48 @@ impl BpeTokenizer {
         Self::new(vocab, cp.v_merges.clone(), cp.config.clone())
     }
 
-    // Improved ASCII pre-tokenization:
-    // - Splits by whitespace
-    // - Separates common punctuation as standalone tokens
-    // - Keeps only ASCII output for consistency with the rest of the project
-    fn pre_tokenize_ascii_ws_punct(s_text: &str) -> Vec<String> {
+    // Apply Unicode normalization to ensure deterministic training/encoding.
+    // NOTE: This uses a minimal internal implementation:
+    // - "none": return as-is
+    // - "nfc": use utils::normalize_text_utf8_nfc
+    fn normalize_unicode_deterministic(&self, s_text: &str) -> String {
+        if self.config.s_unicode_normalization == "nfc" {
+            utils::normalize_text_utf8_nfc(s_text)
+        } else {
+            s_text.to_string()
+        }
+    }
+
+    // UTF-8 aware pre-tokenization:
+    // - Split on Unicode whitespace (Rust split_whitespace already supports this)
+    // - Separate punctuation using Unicode general category approximation:
+    //   - treat any char that is not alphanumeric and not underscore as delimiter token,
+    //     but keep it as its own token (except whitespace)
+    // - Preserve all UTF-8 characters (no replacement by UNK)
+    fn pre_tokenize_utf8_ws_punct(s_text: &str) -> Vec<String> {
         let mut v_out: Vec<String> = Vec::new();
 
-        // Normalize to ASCII-ish representation used by the project.
-        // This keeps behavior deterministic and avoids hidden unicode variants.
-        let s_norm = utils::normalize_text_ascii(s_text);
-
-        for s_piece in s_norm.split_whitespace() {
+        for s_piece in s_text.split_whitespace() {
             if s_piece.is_empty() {
                 continue;
             }
 
             let mut s_buf: String = String::new();
             for ch in s_piece.chars() {
-                if !ch.is_ascii() {
-                    // Non-ASCII characters are replaced by a placeholder token path.
-                    // This avoids panics and keeps behavior stable.
-                    if !s_buf.is_empty() {
-                        v_out.push(s_buf.clone());
-                        s_buf.clear();
-                    }
-                    v_out.push(S_UNK.to_string());
+                // Keep combining marks, letters, digits.
+                let b_is_word = ch.is_alphanumeric() || ch == '_';
+
+                if b_is_word {
+                    s_buf.push(ch);
                     continue;
                 }
 
-                // Punctuation segmentation. This is intentionally conservative.
-                if matches!(ch, '.' | ',' | ':' | ';' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'') {
-                    if !s_buf.is_empty() {
-                        v_out.push(s_buf.clone());
-                        s_buf.clear();
-                    }
-                    v_out.push(ch.to_string());
-                } else {
-                    s_buf.push(ch);
+                // ch is punctuation or symbol (but not whitespace because split_whitespace removed it)
+                if !s_buf.is_empty() {
+                    v_out.push(s_buf.clone());
+                    s_buf.clear();
                 }
+                v_out.push(ch.to_string());
             }
 
             if !s_buf.is_empty() {
@@ -169,18 +183,19 @@ impl BpeTokenizer {
     }
 
     fn pre_tokenize(s_text: &str, config: &BpeTokenizerConfig) -> Vec<String> {
-        // Future proof dispatch based on config.s_pre_tokenizer.
-        // Only one mode is implemented to keep behavior explicit.
-        if config.s_pre_tokenizer == "ascii_ws_punct_v1" {
-            Self::pre_tokenize_ascii_ws_punct(s_text)
+        // Keep dispatch explicit.
+        if config.s_pre_tokenizer == "utf8_ws_punct_v1" {
+            Self::pre_tokenize_utf8_ws_punct(s_text)
         } else {
-            // Safe fallback.
-            Self::pre_tokenize_ascii_ws_punct(s_text)
+            // Safe fallback: UTF-8 path to prevent data loss.
+            Self::pre_tokenize_utf8_ws_punct(s_text)
         }
     }
 
     pub fn encode_text(&self, s_text: &str, b_add_bos_eos: bool) -> Vec<usize> {
         let mut v_ids: Vec<usize> = Vec::new();
+
+        let s_norm = self.normalize_unicode_deterministic(s_text);
 
         if b_add_bos_eos {
             if let Some(i_bos) = self.vocab.encode(S_BOS) {
@@ -188,7 +203,7 @@ impl BpeTokenizer {
             }
         }
 
-        for s_word in Self::pre_tokenize(s_text, &self.config).into_iter() {
+        for s_word in Self::pre_tokenize(&s_norm, &self.config).into_iter() {
             let mut v_word = self.encode_word(&s_word);
             v_ids.append(&mut v_word);
         }
@@ -212,11 +227,13 @@ impl BpeTokenizer {
                 None => S_UNK.to_string(),
             };
 
+            // Skip special tokens.
             if s_tok == S_PAD || s_tok == S_UNK || s_tok == S_BOS || s_tok == S_EOS {
                 continue;
             }
 
-            if utils::is_tag_like_ascii(&s_tok) {
+            // Keep previous tag filter, but make it UTF-8 safe (no ASCII conversion).
+            if utils::is_tag_like_utf8(&s_tok) {
                 continue;
             }
 
@@ -240,10 +257,10 @@ impl BpeTokenizer {
                 continue;
             }
 
-            // For punctuation tokens, close current and emit punctuation as separate token.
-            if s_tok.len() == 1 {
+            // For punctuation tokens (single char and not alphanumeric), close current and emit.
+            if s_tok.chars().count() == 1 {
                 let ch = s_tok.chars().next().unwrap();
-                if matches!(ch, '.' | ',' | ':' | ';' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'') {
+                if !(ch.is_alphanumeric() || ch == '_') {
                     if !s_current.is_empty() {
                         v_words.push(s_current.clone());
                         s_current.clear();
@@ -260,7 +277,8 @@ impl BpeTokenizer {
             v_words.push(s_current);
         }
 
-        utils::normalize_text_ascii(&v_words.join(" "))
+        // UTF-8 safe normalization (whitespace trimming only, no lossy conversion).
+        utils::normalize_text_utf8_spacing(&v_words.join(" "))
     }
 
     pub fn encode_word(&self, s_word: &str) -> Vec<usize> {
@@ -270,14 +288,15 @@ impl BpeTokenizer {
             return vec![i_unk];
         }
 
-        // Keep behavior stable for punctuation tokens: treat them as atomic symbols.
-        if s_word.len() == 1 {
+        // Keep behavior stable for single-character punctuation tokens: treat them as atomic symbols.
+        if s_word.chars().count() == 1 {
             let ch = s_word.chars().next().unwrap();
-            if matches!(ch, '.' | ',' | ':' | ';' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'') {
+            if !(ch.is_alphanumeric() || ch == '_') {
                 return vec![self.vocab.encode(s_word).unwrap_or(i_unk)];
             }
         }
 
+        // BPE symbol stream is Unicode scalar values (Rust char) plus word boundary.
         let mut v_syms: Vec<String> = s_word.chars().map(|c| c.to_string()).collect();
         v_syms.push(S_WB.to_string());
 
@@ -344,10 +363,7 @@ impl BpeTokenizer {
     }
 
     // Deterministic training API using a config struct.
-    pub fn train_from_corpus_with_config(
-        v_texts: &[String],
-        config: BpeTokenizerConfig,
-    ) -> Result<Self, String> {
+    pub fn train_from_corpus_with_config(v_texts: &[String], config: BpeTokenizerConfig) -> Result<Self, String> {
         if config.i_vocab_target < 10 {
             return Err("vocab_target_too_small".to_string());
         }
@@ -355,10 +371,18 @@ impl BpeTokenizer {
             return Err("empty_corpus".to_string());
         }
 
-        // Deterministic order: avoid HashMap iteration nondeterminism by using a sorted Vec later.
+        // Deterministic word freq based on stable iteration later.
         let mut m_word_freq: HashMap<String, usize> = HashMap::new();
+
+        // Apply same normalization used by encode_text to ensure training/usage symmetry.
         for s in v_texts.iter() {
-            for w in Self::pre_tokenize(s, &config).into_iter() {
+            let s_norm = if config.s_unicode_normalization == "nfc" {
+                utils::normalize_text_utf8_nfc(s)
+            } else {
+                s.to_string()
+            };
+
+            for w in Self::pre_tokenize(&s_norm, &config).into_iter() {
                 *m_word_freq.entry(w).or_insert(0) += 1;
             }
         }
@@ -367,27 +391,15 @@ impl BpeTokenizer {
         let mut set_symbols: HashSet<String> = HashSet::new();
         set_symbols.insert(S_WB.to_string());
 
-        // Collect chars from words.
+        // Collect chars from words (full Unicode).
         for (s_word, _) in m_word_freq.iter() {
             for c in s_word.chars() {
-                if c.is_ascii() {
-                    set_symbols.insert(c.to_string());
-                }
+                set_symbols.insert(c.to_string());
             }
         }
 
-        // Add punctuation tokens explicitly so they can be represented and do not collapse into UNK.
-        for s_p in [".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", "\"", "'"] {
-            set_symbols.insert(s_p.to_string());
-        }
-
         // Special tokens are included first and remain stable.
-        let mut v_vocab: Vec<String> = vec![
-            S_PAD.to_string(),
-            S_UNK.to_string(),
-            S_BOS.to_string(),
-            S_EOS.to_string(),
-        ];
+        let mut v_vocab: Vec<String> = vec![S_PAD.to_string(), S_UNK.to_string(), S_BOS.to_string(), S_EOS.to_string()];
 
         let mut v_initial: Vec<String> = set_symbols.into_iter().collect();
         v_initial.sort();
@@ -409,7 +421,6 @@ impl BpeTokenizer {
         // Deterministic tie-breaking for merges:
         // - primary: highest count
         // - secondary: lexical order of pair (left, right)
-        // This avoids run-to-run differences for equal counts.
         while v_vocab.len() < config.i_vocab_target {
             let m_pair_counts = Self::count_pairs(&m_word_syms, &m_word_freq);
 
@@ -424,7 +435,6 @@ impl BpeTokenizer {
                         if i_count > *i_best {
                             opt_best = Some((k.clone(), i_count));
                         } else if i_count == *i_best {
-                            // Tie-breaker: lexical order.
                             if k.0 < k_best.0 || (k.0 == k_best.0 && k.1 < k_best.1) {
                                 opt_best = Some((k.clone(), i_count));
                             }
@@ -461,25 +471,16 @@ impl BpeTokenizer {
             }
         }
 
-        // Build vocab from stable ordering. No RNG required here, but seed is stored in config.
         let v_refs: Vec<&str> = v_vocab.iter().map(|s| s.as_str()).collect();
         let vocab = Vocab::new(v_refs);
 
         Self::new(vocab, v_merges, config)
     }
 
-    // Backward compatible wrapper with explicit seed default.
-    pub fn train_from_corpus(
-        v_texts: &[String],
-        i_vocab_target: usize,
-        i_min_pair_count: usize,
-    ) -> Result<Self, String> {
+    pub fn train_from_corpus(v_texts: &[String], i_vocab_target: usize, i_min_pair_count: usize) -> Result<Self, String> {
         let mut config = BpeTokenizerConfig::default();
         config.i_vocab_target = i_vocab_target;
         config.i_min_pair_count = i_min_pair_count;
-
-        // Keep a deterministic seed by default.
-        // If desired, callers can switch to train_from_corpus_with_config for custom seeds.
         Self::train_from_corpus_with_config(v_texts, config)
     }
 
