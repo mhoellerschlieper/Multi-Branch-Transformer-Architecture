@@ -1,11 +1,18 @@
 // main.rs
 // Description: Binary entry point with menu loop. Builds model from tokenizer,
 //              supports checkpoint save and load.
+//
+//              Extension:
+//              - After each Ask/predict, print runtime metrics:
+//                duration, token_count, tokens_per_sec, and 5 additional metrics.
+//
 // History:
 // - 2026-02-01: Add menu loop and checkpoint save and load.
 // - 2026-02-01: Fix checkpoint load by rebuilding model from checkpoint tokenizer vocab.
 // - 2026-02-07: Add MTB parallel block group layer to support multi branch topology.
 // - 2026-02-07: Add TransformerSequence and generalize ParallelBlockGroup to accept Layer branches.
+// - 2026-02-08: Add menu commands T (topology) and M (metrics) to main loop.
+// - 2026-02-08: Add post predict metrics: duration, token count, tokens/sec, plus 5 extra metrics.
 // Author: Marcus Schlieper
 
 mod layer;
@@ -15,9 +22,11 @@ mod train;
 mod utils;
 
 use std::io::Write;
+use std::time::Instant;
 
 use crate::layer::{
-    Embeddings, Llm, OutputProjection, TransformerBlock, ParallelBlockGroup, TransformerSequence, Layer
+    Embeddings, Layer, Llm, OutputProjection, ParallelBlockGroup, TransformerBlock,
+    TransformerSequence,
 };
 use crate::tokenizer::{BpeTokenizer, BpeTokenizerConfig};
 use crate::train::{Dataset, DatasetType};
@@ -46,15 +55,25 @@ fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
     let block2_2 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
     let block2_3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
     let block2_4 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block2_5 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block2_6 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block2_7 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block2_8 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
 
     let seq_2_1 = TransformerSequence::new(vec![block2_1, block2_2])
         .expect("transformer_sequence_new_failed");
     let seq_2_2 = TransformerSequence::new(vec![block2_3, block2_4])
         .expect("transformer_sequence_new_failed");
+    let seq_2_3 = TransformerSequence::new(vec![block2_5, block2_6])
+        .expect("transformer_sequence_new_failed");
+    let seq_2_4 = TransformerSequence::new(vec![block2_7, block2_8])
+        .expect("transformer_sequence_new_failed");
 
     let parallel_block2 = ParallelBlockGroup::new(vec![
         Box::new(seq_2_1) as Box<dyn Layer>,
         Box::new(seq_2_2) as Box<dyn Layer>,
+        Box::new(seq_2_3) as Box<dyn Layer>,
+        Box::new(seq_2_4) as Box<dyn Layer>,
     ])
     .expect("parallel_block_group_new_failed");
 
@@ -80,63 +99,165 @@ fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
     llm
 }
 
-// - Ask questions repeatedly
-// - Stop when user types "done" (case-insensitive)
-// - Store Q/A pairs and print a short summary at the end
-fn run_interview_until_done_ascii() -> Result<(), String> {
-    let mut v_qa: Vec<(String, String)> = Vec::new();
-    let mut i_turn: usize = 0;
+// ASCII topology rendering for the current in-memory network.
+fn topology_to_ascii_lines(llm: &mut Llm) -> Vec<String> {
+    // History:
+    // - 2026-02-08: Add ASCII topology report for menu command T.
+    let mut v_out: Vec<String> = Vec::new();
 
-    println!("");
-    println!("=== Interview Mode ===");
-    println!("Enter done to finish.");
-    println!("");
+    v_out.push("=== Model Topology (ASCII) ===".to_string());
+    v_out.push(format!(
+        "max_seq_len={}, embedding_dim={}, hidden_dim={}",
+        crate::MAX_SEQ_LEN,
+        crate::EMBEDDING_DIM,
+        crate::HIDDEN_DIM
+    ));
+    v_out.push(format!("total_parameters={}", llm.total_parameters()));
+    v_out.push("".to_string());
 
-    loop {
-        i_turn = i_turn.saturating_add(1);
+    for (i_idx, layer) in llm.network.iter_mut().enumerate() {
+        let s_t = layer.layer_type().to_string();
 
-        // Single question per message, repeated until done.
-        // The question is intentionally stable and ASCII only.
-        let s_question = format!(
-            "Question {}: Describe the required core functionality and constraints:",
-            i_turn
-        );
+        if s_t == "ParallelBlockGroup" {
+            let opt_pg = layer
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
 
-        println!("{}", s_question);
-        print!("Answer: ");
-        let _ = std::io::stdout().flush();
+            if let Some(pg) = opt_pg {
+                v_out.push(format!(
+                    "[{}] ParallelBlockGroup branches={}",
+                    i_idx,
+                    pg.num_branches()
+                ));
 
-        let s_answer = read_line_ascii_trimmed()?;
-        if s_answer.to_lowercase() == "done" {
-            break;
-        }
+                // NOTE: v_branches is private. This requires a public helper in layer.rs:
+                // ParallelBlockGroup::branch_layer_types_ascii()
+                let v_branch_types = pg.branch_layer_types_ascii();
+                for (i_b, s_bt) in v_branch_types.iter().enumerate() {
+                    v_out.push(format!("  - branch[{}] {}", i_b, s_bt));
+                }
+                continue;
+            }
 
-        if s_answer.is_empty() {
-            println!("Answer empty. Please provide text or enter done.");
+            v_out.push(format!("[{}] ParallelBlockGroup (downcast_failed)", i_idx));
             continue;
         }
 
-        v_qa.push((s_question, s_answer));
-        println!("");
+        v_out.push(format!(
+            "[{}] {} parameters={}",
+            i_idx,
+            s_t,
+            layer.parameters()
+        ));
     }
 
-    println!("");
-    println!("=== Interview Summary ===");
-    println!("Collected items: {}", v_qa.len());
-    for (i, (q, a)) in v_qa.iter().enumerate() {
-        println!("");
-        println!("Item {}:", i + 1);
-        println!("Q: {}", q);
-        println!("A: {}", a);
-    }
-
-    Ok(())
+    v_out
 }
 
+// Print MTB metrics and an ASCII report (manual trigger).
+fn print_metrics_ascii(llm: &mut Llm) {
+    // History:
+    // - 2026-02-08: Add menu command M to print MTB diagnostics.
+    println!("");
+    println!("=== Metrics (MTB diagnostics) ===");
+    llm.run_post_load_mtb_diagnostics_ascii();
+}
+
+// Post predict runtime metrics.
+#[derive(Clone, Debug)]
+struct predict_metrics_ascii {
+    // Primary metrics requested.
+    d_duration_ms: f64,
+    i_generated_tokens: usize,
+    d_tokens_per_sec: f64,
+
+    // Five additional metrics (new).
+    i_input_tokens: usize,
+    i_total_tokens: usize,
+    d_avg_chars_per_token_out: f64,
+    d_output_chars_per_sec: f64,
+    d_effective_context_utilization: f64,
+}
+
+fn clamp_f64(d_x: f64, d_min: f64, d_max: f64) -> f64 {
+    if !d_x.is_finite() {
+        return d_min;
+    }
+    if d_x < d_min {
+        d_min
+    } else if d_x > d_max {
+        d_max
+    } else {
+        d_x
+    }
+}
+
+fn compute_predict_metrics_ascii(
+    llm: &Llm,
+    s_prompt: &str,
+    s_output: &str,
+    d_duration_ms: f64,
+) -> predict_metrics_ascii {
+    // NOTE:
+    // Token counts are computed via the tokenizer path if available.
+    // This is safe but can be computationally nontrivial; however, it is acceptable
+    // for interactive CLI diagnostics.
+
+    let i_input_tokens = llm.tokenize(s_prompt).map(|v| v.len()).unwrap_or(0);
+
+    // Output token count: encode output as standalone text.
+    // This approximates generated token count; if the model emits special tokens,
+    // decode filters them, so the re-encoding count can be slightly different.
+    let i_output_tokens = llm.tokenize(s_output).map(|v| v.len()).unwrap_or(0);
+
+    let i_total_tokens = i_input_tokens.saturating_add(i_output_tokens);
+
+    let d_sec = (d_duration_ms / 1000.0).max(1e-9);
+    let d_tokens_per_sec = (i_output_tokens as f64) / d_sec;
+
+    let i_out_chars = s_output.len();
+    let d_avg_chars_per_token_out = if i_output_tokens == 0 {
+        0.0
+    } else {
+        (i_out_chars as f64) / (i_output_tokens as f64)
+    };
+    let d_output_chars_per_sec = (i_out_chars as f64) / d_sec;
+
+    // Effective context utilization: total tokens relative to MAX_SEQ_LEN.
+    // This provides a quick indication of truncation risk and headroom.
+    let d_effective_context_utilization =
+        (i_total_tokens as f64) / (crate::MAX_SEQ_LEN as f64).max(1.0);
+
+    predict_metrics_ascii {
+        d_duration_ms: clamp_f64(d_duration_ms, 0.0, 1.0e12),
+        i_generated_tokens: i_output_tokens,
+        d_tokens_per_sec: clamp_f64(d_tokens_per_sec, 0.0, 1.0e12),
+        i_input_tokens,
+        i_total_tokens,
+        d_avg_chars_per_token_out: clamp_f64(d_avg_chars_per_token_out, 0.0, 1.0e9),
+        d_output_chars_per_sec: clamp_f64(d_output_chars_per_sec, 0.0, 1.0e12),
+        d_effective_context_utilization: clamp_f64(d_effective_context_utilization, 0.0, 1.0),
+    }
+}
+
+fn print_predict_metrics_ascii(m: &predict_metrics_ascii) {
+    // Output format is ASCII only.
+    println!("");
+    println!("=== Predict Metrics ===");
+    println!("duration_ms: {:.3}", m.d_duration_ms);
+    println!("generated_tokens: {}", m.i_generated_tokens);
+    println!("tokens_per_sec: {:.3}", m.d_tokens_per_sec);
+    println!("input_tokens: {}", m.i_input_tokens);
+    println!("total_tokens: {}", m.i_total_tokens);
+    println!("avg_chars_per_token_out: {:.3}", m.d_avg_chars_per_token_out);
+    println!("output_chars_per_sec: {:.3}", m.d_output_chars_per_sec);
+    println!(
+        "effective_context_utilization: {:.6}",
+        m.d_effective_context_utilization
+    );
+}
 
 fn main() {
-    let s_prompt = String::from("User: How do mountains form?");
-
     let mut s_checkpoint_path: String = "../../checkpoints/llm_checkpoint.json".to_string();
 
     let dataset = Dataset::new(
@@ -145,8 +266,6 @@ fn main() {
         DatasetType::JSON,
     );
 
-    // NOTE: For now, keep initial tokenizer training to allow immediate usage.
-    // The important fix is that loading rebuilds the model to match checkpoint vocab.
     let mut v_corpus: Vec<String> = Vec::new();
     v_corpus.extend(dataset.pretraining_data.clone());
     v_corpus.extend(dataset.chat_training_data.clone());
@@ -154,7 +273,6 @@ fn main() {
     let mut config = BpeTokenizerConfig::default();
     config.i_vocab_target = 2000;
     config.i_min_pair_count = 2;
-    // config.u64_seed can be changed for experimentation, but remains stored in checkpoint.
 
     let bpe = match BpeTokenizer::train_from_corpus_with_config(&v_corpus, config) {
         Ok(tok) => tok,
@@ -174,8 +292,6 @@ fn main() {
     );
     println!("Total parameters: {}", llm.total_parameters());
 
-    
-
     loop {
         println!("\n--- Menu Mode ---");
         println!("Commands:");
@@ -184,24 +300,28 @@ fn main() {
         println!("  s Save checkpoint");
         println!("  a Ask");
         println!("  o Toggle outage simulation (test only)");
+        println!("  y Topology (ASCII)");
+        println!("  x Metrics (MTB diagnostics)");
         println!("  e Exit");
         print!("\nEnter command: ");
         let _ = std::io::stdout().flush();
 
         let s_cmd = match read_line_ascii_trimmed() {
-            Ok(s) => s.to_lowercase(),
+            Ok(s) => s,
             Err(e) => {
                 println!("Input error: {}", e);
                 continue;
             }
         };
 
-        if s_cmd == "e" {
+        let s_cmd_lc = s_cmd.to_lowercase();
+
+        if s_cmd_lc == "e" {
             println!("Exit.");
             break;
         }
 
-        if s_cmd == "t" {
+        if s_cmd_lc == "t" {
             let v_pretraining_examples: Vec<&str> = dataset
                 .pretraining_data
                 .iter()
@@ -243,7 +363,7 @@ fn main() {
             continue;
         }
 
-        if s_cmd == "s" {
+        if s_cmd_lc == "s" {
             print!("Enter checkpoint path or press Enter for default: ");
             let _ = std::io::stdout().flush();
 
@@ -259,7 +379,7 @@ fn main() {
                 s_checkpoint_path = s_path;
             }
 
-            match llm.save_checkpoint(&s_checkpoint_path) {
+            match llm.save_checkpoint_llm_checkpoint_v2(&s_checkpoint_path) {
                 Ok(()) => println!("Saved checkpoint: {}", s_checkpoint_path),
                 Err(e) => println!("Save failed: {}", e),
             }
@@ -267,7 +387,7 @@ fn main() {
             continue;
         }
 
-        if s_cmd == "l" {
+        if s_cmd_lc == "l" {
             print!("Enter checkpoint path or press Enter for default: ");
             let _ = std::io::stdout().flush();
 
@@ -283,8 +403,7 @@ fn main() {
                 s_checkpoint_path = s_path;
             }
 
-            // IMPORTANT: Rebuild model to match checkpoint tokenizer and vocab size.
-            match Llm::load_checkpoint_rebuild(&s_checkpoint_path) {
+            match Llm::load_checkpoint_llm_checkpoint_v2_rebuild(&s_checkpoint_path) {
                 Ok(llm_loaded) => {
                     llm = llm_loaded;
                     println!("Loaded checkpoint: {}", s_checkpoint_path);
@@ -294,7 +413,8 @@ fn main() {
 
             continue;
         }
-        if s_cmd == "o" {
+
+        if s_cmd_lc == "o" {
             let b_new = !llm.is_outage_simulation_enabled();
             llm.set_outage_simulation_enabled(b_new);
 
@@ -303,11 +423,27 @@ fn main() {
             } else {
                 println!("Outage simulation: disabled");
             }
+
             continue;
         }
-        if s_cmd == "a" {
-             println!("Interactive mode. Type 'done' to exit.");
-             loop {
+
+        if s_cmd == "y" {
+            let v_lines = topology_to_ascii_lines(&mut llm);
+            println!("");
+            for s_line in v_lines {
+                println!("{}", s_line);
+            }
+            continue;
+        }
+
+        if s_cmd == "x" {
+            print_metrics_ascii(&mut llm);
+            continue;
+        }
+
+        if s_cmd_lc == "a" {
+            println!("Interactive mode. Type 'done' to exit.");
+            loop {
                 print!("Enter prompt: ");
                 let _ = std::io::stdout().flush();
 
@@ -329,11 +465,29 @@ fn main() {
                 }
 
                 let s_formatted = format!("User: {}", s_user);
-                match llm.predict(&s_formatted) {
-                    Ok(s_out) => println!("Model output: {}", s_out),
-                    Err(e) => println!("Model output error: {}", e),
+
+                // Metrics timing starts immediately before predict.
+                let t0 = Instant::now();
+                let r_predict = llm.predict(&s_formatted);
+                let d_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                match r_predict {
+                    Ok(s_out) => {
+                        println!("Model output: {}", s_out);
+
+                        // After each ask/predict, print the requested metrics.
+                        let m = compute_predict_metrics_ascii(&llm, &s_formatted, &s_out, d_ms);
+                        print_predict_metrics_ascii(&m);
+                    }
+                    Err(e) => {
+                        println!("Model output error: {}", e);
+
+                        // Still print minimal metrics even on error.
+                        let m = compute_predict_metrics_ascii(&llm, &s_formatted, "", d_ms);
+                        print_predict_metrics_ascii(&m);
+                    }
                 }
-             }
+            }
 
             continue;
         }

@@ -51,12 +51,12 @@ pub fn decode_via_vocab_ascii(vocab: &Vocab, v_ids: &[usize]) -> String {
 
 // ---- Checkpoint helpers (JSON) ----
 
-pub fn checkpoint_to_json_ascii(cp: &crate::layer::LlmCheckpoint) -> Result<String, String> {
+pub fn checkpoint_to_json_ascii(cp: &crate::layer::llm_checkpoint_v2) -> Result<String, String> {
     // Security: serialization must not execute code, JSON is data only.
     serde_json::to_string(cp).map_err(|_| "checkpoint_serialize_error".to_string())
 }
 
-pub fn checkpoint_from_json_ascii(s_json: &str) -> Result<crate::layer::LlmCheckpoint, String> {
+pub fn checkpoint_from_json_ascii(s_json: &str) -> Result<crate::layer::llm_checkpoint_v2, String> {
     if s_json.trim().is_empty() {
         return Err("checkpoint_json_empty".to_string());
     }

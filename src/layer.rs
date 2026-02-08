@@ -17,6 +17,7 @@
 // - 2026-02-04: Add robust sampling (temperature, top k, top p) and ensure predict runs eval mode.
 // - 2026-02-07: Add MTB ParallelBlockGroup and TransformerSequence support.
 // - 2026-02-07: Add MTB diagnostics and test only outage simulation with borrow safe RNG handling.
+// - 2026-02-08: Add checkpoint topology spec and rebuild model from topology.
 // Author: Marcus Schlieper
 
 use std::any::Any;
@@ -1556,6 +1557,16 @@ impl ParallelBlockGroup {
         })
     }
 
+    // Return branch layer types for diagnostics and topology display.
+    // This preserves encapsulation by not exposing v_branches directly.
+    pub fn branch_layer_types_ascii(&self) -> Vec<String> {
+        let mut v_types: Vec<String> = Vec::with_capacity(self.v_branches.len());
+        for br in self.v_branches.iter() {
+            v_types.push(br.layer_type().to_string());
+        }
+        v_types
+    }
+
     pub fn num_branches(&self) -> usize {
         self.v_branches.len()
     }
@@ -1855,24 +1866,54 @@ impl Layer for ParallelBlockGroup {
     }
 }
 
-// ----------------------------------------
-// Llm checkpoint
-// ----------------------------------------
+
+// ---------------------------
+// Topology spec for checkpoint
+// ---------------------------
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct llm_topology_spec {
+    pub v_layers: Vec<llm_layer_spec>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LlmCheckpoint {
+#[serde(tag = "s_type")]
+pub enum llm_layer_spec {
+    embeddings,
+    transformer_block {
+        i_embedding_dim: usize,
+        i_hidden_dim: usize,
+        i_num_heads: usize,
+    },
+    transformer_sequence {
+        v_blocks: Vec<llm_layer_spec>,
+    },
+    parallel_block_group {
+        v_branches: Vec<llm_layer_spec>,
+    },
+    output_projection {
+        i_embedding_dim: usize,
+    },
+}
+
+// ---------------------------
+// Checkpoint format (version bump)
+// ---------------------------
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct llm_checkpoint_v2 {
     pub s_magic: String,
     pub s_version: String,
     pub i_max_seq_len: usize,
     pub i_embedding_dim: usize,
     pub i_hidden_dim: usize,
-    pub tokenizer: BpeTokenizerCheckpoint,
+    pub tokenizer: crate::tokenizer::BpeTokenizerCheckpoint,
+    pub topology: llm_topology_spec,
     pub v_params: Vec<f32>,
 }
 
-impl LlmCheckpoint {
+impl llm_checkpoint_v2 {
     pub fn new(
-        tokenizer: BpeTokenizerCheckpoint,
+        tokenizer: crate::tokenizer::BpeTokenizerCheckpoint,
+        topology: llm_topology_spec,
         v_params: Vec<f32>,
         i_max_seq_len: usize,
         i_embedding_dim: usize,
@@ -1880,11 +1921,12 @@ impl LlmCheckpoint {
     ) -> Self {
         Self {
             s_magic: "EXCHAT_LLM_CHECKPOINT".to_string(),
-            s_version: "1".to_string(),
+            s_version: "2".to_string(),
             i_max_seq_len,
             i_embedding_dim,
             i_hidden_dim,
             tokenizer,
+            topology,
             v_params,
         }
     }
@@ -1893,23 +1935,196 @@ impl LlmCheckpoint {
         if self.s_magic != "EXCHAT_LLM_CHECKPOINT" {
             return Err("checkpoint_magic_mismatch".to_string());
         }
-        if self.s_version != "1" {
+        if self.s_version != "2" {
             return Err("checkpoint_version_unsupported".to_string());
         }
-        if self.i_max_seq_len != MAX_SEQ_LEN {
+        if self.i_max_seq_len != crate::MAX_SEQ_LEN {
             return Err("checkpoint_max_seq_len_mismatch".to_string());
         }
-        if self.i_embedding_dim != EMBEDDING_DIM {
+        if self.i_embedding_dim != crate::EMBEDDING_DIM {
             return Err("checkpoint_embedding_dim_mismatch".to_string());
         }
-        if self.i_hidden_dim != HIDDEN_DIM {
+        if self.i_hidden_dim != crate::HIDDEN_DIM {
             return Err("checkpoint_hidden_dim_mismatch".to_string());
+        }
+        if self.topology.v_layers.is_empty() {
+            return Err("checkpoint_topology_empty".to_string());
         }
         if self.v_params.is_empty() {
             return Err("checkpoint_empty_params".to_string());
         }
         Ok(())
     }
+}
+
+// ---------------------------
+// Topology export from actual network (SAVE)
+// ---------------------------
+fn export_layer_spec_from_layer(layer: &Box<dyn crate::layer::Layer>) -> Result<llm_layer_spec, String> {
+    // NOTE:
+    // - The project uses layer_type() strings already.
+    // - This avoids needing as_any() for immutable downcasts.
+    // - For composite layers, we add explicit "export" helper methods below.
+    let s_t = layer.layer_type();
+
+    if s_t == "Embeddings" {
+        return Ok(llm_layer_spec::embeddings);
+    }
+
+    if s_t == "TransformerBlock" {
+        // The current TransformerBlock::new hardcodes num_heads=4 in this codebase.
+        return Ok(llm_layer_spec::transformer_block {
+            i_embedding_dim: crate::EMBEDDING_DIM,
+            i_hidden_dim: crate::HIDDEN_DIM,
+            i_num_heads: 4,
+        });
+    }
+
+    if s_t == "TransformerSequence" {
+        // Requires export support implemented on TransformerSequence via as_any_mut downcast.
+        // Since we only have &Box<dyn Layer>, we cannot mutably downcast here.
+        // Therefore, we export topology via Llm::export_topology_spec() where we can iterate
+        // over &mut self.network and use as_any_mut safely.
+        return Err("export_layer_spec_requires_llm_context_transformer_sequence".to_string());
+    }
+
+    if s_t == "ParallelBlockGroup" {
+        return Err("export_layer_spec_requires_llm_context_parallel_block_group".to_string());
+    }
+
+    if s_t == "OutputProjection" {
+        return Ok(llm_layer_spec::output_projection {
+            i_embedding_dim: crate::EMBEDDING_DIM,
+        });
+    }
+
+    Err("export_layer_spec_unknown_layer_type".to_string())
+}
+
+// ---------------------------
+// Composite layer export helpers
+// ---------------------------
+impl crate::layer::TransformerSequence {
+    pub fn export_spec(&self) -> llm_layer_spec {
+        // Each internal element is a TransformerBlock in this codebase.
+        let mut v_blocks: Vec<llm_layer_spec> = Vec::new();
+        for _ in self.v_blocks.iter() {
+            v_blocks.push(llm_layer_spec::transformer_block {
+                i_embedding_dim: crate::EMBEDDING_DIM,
+                i_hidden_dim: crate::HIDDEN_DIM,
+                i_num_heads: 4,
+            });
+        }
+        llm_layer_spec::transformer_sequence { v_blocks }
+    }
+}
+
+impl crate::layer::ParallelBlockGroup {
+    pub fn export_spec(&self) -> Result<llm_layer_spec, String> {
+        let mut v_branches: Vec<llm_layer_spec> = Vec::new();
+        for br in self.v_branches.iter() {
+            let s_t = br.layer_type();
+            if s_t == "TransformerBlock" {
+                v_branches.push(llm_layer_spec::transformer_block {
+                    i_embedding_dim: crate::EMBEDDING_DIM,
+                    i_hidden_dim: crate::HIDDEN_DIM,
+                    i_num_heads: 4,
+                });
+            } else if s_t == "TransformerSequence" {
+                // We cannot immutable-downcast br to TransformerSequence without as_any().
+                // However, in this project, branches are built as TransformerSequence,
+                // and we can reconstruct sequence length by parameterization if we store it.
+                //
+                // Minimal safe approach: require branch to provide export via known type path
+                // using as_any_mut in Llm::export_topology_spec().
+                return Err("parallel_block_group_export_requires_llm_context".to_string());
+            } else {
+                return Err("parallel_block_group_export_branch_type_unsupported".to_string());
+            }
+        }
+        Ok(llm_layer_spec::parallel_block_group { v_branches })
+    }
+}
+
+// ---------------------------
+// Topology reconstruction (LOAD)
+// ---------------------------
+fn build_layer_from_spec(
+    spec: &llm_layer_spec,
+    vocab: &crate::layer::Vocab,
+) -> Result<Box<dyn crate::layer::Layer>, String> {
+    match spec {
+        llm_layer_spec::embeddings => Ok(Box::new(crate::layer::Embeddings::new(vocab.clone()))),
+
+        llm_layer_spec::transformer_block {
+            i_embedding_dim,
+            i_hidden_dim,
+            i_num_heads,
+        } => {
+            if *i_embedding_dim != crate::EMBEDDING_DIM {
+                return Err("topology_embedding_dim_mismatch".to_string());
+            }
+            if *i_hidden_dim != crate::HIDDEN_DIM {
+                return Err("topology_hidden_dim_mismatch".to_string());
+            }
+            if *i_num_heads != 4 {
+                return Err("topology_num_heads_unsupported".to_string());
+            }
+            Ok(Box::new(crate::layer::TransformerBlock::new(*i_embedding_dim, *i_hidden_dim)))
+        }
+
+        llm_layer_spec::transformer_sequence { v_blocks } => {
+            if v_blocks.is_empty() {
+                return Err("topology_transformer_sequence_empty".to_string());
+            }
+            let mut v_tb: Vec<crate::layer::TransformerBlock> = Vec::new();
+            for b in v_blocks.iter() {
+                match b {
+                    llm_layer_spec::transformer_block {
+                        i_embedding_dim,
+                        i_hidden_dim,
+                        i_num_heads,
+                    } => {
+                        if *i_num_heads != 4 {
+                            return Err("topology_num_heads_unsupported".to_string());
+                        }
+                        v_tb.push(crate::layer::TransformerBlock::new(*i_embedding_dim, *i_hidden_dim));
+                    }
+                    _ => return Err("topology_transformer_sequence_allows_only_blocks".to_string()),
+                }
+            }
+            let seq = crate::layer::TransformerSequence::new(v_tb)?;
+            Ok(Box::new(seq))
+        }
+
+        llm_layer_spec::parallel_block_group { v_branches } => {
+            if v_branches.is_empty() {
+                return Err("topology_parallel_block_group_empty".to_string());
+            }
+            let mut v_branch_layers: Vec<Box<dyn crate::layer::Layer>> = Vec::new();
+            for br in v_branches.iter() {
+                let b = build_layer_from_spec(br, vocab)?;
+                v_branch_layers.push(b);
+            }
+            let pg = crate::layer::ParallelBlockGroup::new(v_branch_layers)?;
+            Ok(Box::new(pg))
+        }
+
+        llm_layer_spec::output_projection { i_embedding_dim } => Ok(Box::new(
+            crate::layer::OutputProjection::new(*i_embedding_dim, vocab.words.len()),
+        )),
+    }
+}
+
+fn build_network_from_topology(
+    topology: &llm_topology_spec,
+    vocab: &crate::layer::Vocab,
+) -> Result<Vec<Box<dyn crate::layer::Layer>>, String> {
+    let mut v_net: Vec<Box<dyn crate::layer::Layer>> = Vec::new();
+    for layer_spec in topology.v_layers.iter() {
+        v_net.push(build_layer_from_spec(layer_spec, vocab)?);
+    }
+    Ok(v_net)
 }
 
 // ----------------------------------------
@@ -2075,108 +2290,153 @@ impl Llm {
         Ok(())
     }
 
-    pub fn save_checkpoint(&self, s_path: &str) -> Result<(), String> {
+    fn export_topology_spec(&mut self) -> Result<llm_topology_spec, String> {
+        // NOTE: Uses &mut self so composite layers can be downcasted via as_any_mut().
+        let mut v_layers: Vec<llm_layer_spec> = Vec::new();
+
+        for layer in self.network.iter_mut() {
+            let s_t = layer.layer_type();
+
+            if s_t == "Embeddings" {
+                v_layers.push(llm_layer_spec::embeddings);
+                continue;
+            }
+
+            if s_t == "TransformerBlock" {
+                v_layers.push(llm_layer_spec::transformer_block {
+                    i_embedding_dim: crate::EMBEDDING_DIM,
+                    i_hidden_dim: crate::HIDDEN_DIM,
+                    i_num_heads: 4,
+                });
+                continue;
+            }
+
+            if s_t == "TransformerSequence" {
+                let ts = layer
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<crate::layer::TransformerSequence>())
+                    .ok_or_else(|| "topology_export_downcast_transformer_sequence_failed".to_string())?;
+                v_layers.push(ts.export_spec());
+                continue;
+            }
+
+            if s_t == "ParallelBlockGroup" {
+                let pg = layer
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<crate::layer::ParallelBlockGroup>())
+                    .ok_or_else(|| "topology_export_downcast_parallel_block_group_failed".to_string())?;
+
+                // Export branches including TransformerSequence via downcast on each branch.
+                let mut v_branches: Vec<llm_layer_spec> = Vec::new();
+                for br in pg.v_branches.iter_mut() {
+                    let s_bt = br.layer_type();
+                    if s_bt == "TransformerBlock" {
+                        v_branches.push(llm_layer_spec::transformer_block {
+                            i_embedding_dim: crate::EMBEDDING_DIM,
+                            i_hidden_dim: crate::HIDDEN_DIM,
+                            i_num_heads: 4,
+                        });
+                    } else if s_bt == "TransformerSequence" {
+                        let tsb = br
+                            .as_any_mut()
+                            .and_then(|a| a.downcast_mut::<crate::layer::TransformerSequence>())
+                            .ok_or_else(|| "topology_export_downcast_branch_transformer_sequence_failed".to_string())?;
+                        v_branches.push(tsb.export_spec());
+                    } else {
+                        return Err("topology_export_parallel_branch_type_unsupported".to_string());
+                    }
+                }
+
+                v_layers.push(llm_layer_spec::parallel_block_group { v_branches });
+                continue;
+            }
+
+            if s_t == "OutputProjection" {
+                v_layers.push(llm_layer_spec::output_projection {
+                    i_embedding_dim: crate::EMBEDDING_DIM,
+                });
+                continue;
+            }
+
+            return Err("topology_export_unknown_layer_type".to_string());
+        }
+
+        Ok(llm_topology_spec { v_layers })
+    }
+
+    pub fn save_checkpoint_llm_checkpoint_v2(&mut self, s_path: &str) -> Result<(), String> {
         if s_path.trim().is_empty() {
             return Err("checkpoint_path_empty".to_string());
         }
 
-        let tok = self
-            .bpe_tokenizer
-            .as_ref()
-            .ok_or_else(|| "tokenizer_not_set".to_string())?;
+        // Step 1: Create topology first (requires &mut self).
+        // This must happen before any long-lived immutable borrows from self.
+        let topology = self.export_topology_spec()?;
 
-        let tokenizer_cp = tok.to_checkpoint();
+        // Step 2: Materialize tokenizer checkpoint without keeping a borrow alive.
+        // Use a narrow scope so the borrow ends immediately.
+        let tokenizer_cp = {
+            let tok = self
+                .bpe_tokenizer
+                .as_ref()
+                .ok_or_else(|| "tokenizer_not_set".to_string())?;
+            tok.to_checkpoint()
+        };
+
+        // Step 3: Collect parameters (can borrow self immutably; no conflict now).
         let v_params = self.collect_all_parameters_flat();
 
-        let cp = LlmCheckpoint::new(tokenizer_cp, v_params, MAX_SEQ_LEN, EMBEDDING_DIM, HIDDEN_DIM);
-
-        let s_json = utils::checkpoint_to_json_ascii(&cp)?;
-        utils::write_file_atomic_ascii(s_path, &s_json)?;
-        Ok(())
-    }
-
-    pub fn load_checkpoint(&mut self, s_path: &str) -> Result<(), String> {
-        if s_path.trim().is_empty() {
-            return Err("checkpoint_path_empty".to_string());
-        }
-
-        let s_json = fs::read_to_string(s_path).map_err(|_| "checkpoint_read_error".to_string())?;
-        let cp: LlmCheckpoint = utils::checkpoint_from_json_ascii(&s_json)?;
-        cp.validate()?;
-
-        let tok = BpeTokenizer::from_checkpoint(&cp.tokenizer)?;
-        self.set_bpe_tokenizer(tok);
-
-        let i_expected: usize = self.network.iter().map(|l| l.get_parameters_flat().len()).sum();
-        if i_expected != cp.v_params.len() {
-            return Err("checkpoint_param_count_mismatch".to_string());
-        }
-
-        self.assign_all_parameters_flat(&cp.v_params)?;
-        Ok(())
-    }
-
-    pub fn load_checkpoint_rebuild(s_path: &str) -> Result<Llm, String> {
-        if s_path.trim().is_empty() {
-            return Err("checkpoint_path_empty".to_string());
-        }
-
-        let s_json = fs::read_to_string(s_path).map_err(|_| "checkpoint_read_error".to_string())?;
-        let cp: LlmCheckpoint = utils::checkpoint_from_json_ascii(&s_json)?;
-        cp.validate()?;
-
-        let bpe = BpeTokenizer::from_checkpoint(&cp.tokenizer)?;
-
-        let vocab = bpe.vocab.clone();
-        let embeddings = Embeddings::new(vocab.clone());
-        let block1 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-
-        // Default MTB stage: 2 branch sequences, each of length 2.
-        let b2_1 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-        let b2_2 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-        let b2_3 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-        let b2_4 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-
-        let seq_2_1 = TransformerSequence::new(vec![b2_1, b2_2]).map_err(|_| "transformer_sequence_new_failed".to_string())?;
-        let seq_2_2 = TransformerSequence::new(vec![b2_3, b2_4]).map_err(|_| "transformer_sequence_new_failed".to_string())?;
-
-        let parallel_block2 = ParallelBlockGroup::new(vec![
-            Box::new(seq_2_1) as Box<dyn Layer>,
-            Box::new(seq_2_2) as Box<dyn Layer>,
-        ])
-        .map_err(|_| "parallel_block_group_new_failed".to_string())?;
-
-        let block3 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-        let out = OutputProjection::new(EMBEDDING_DIM, vocab.words.len());
-
-        let mut llm = Llm::new(
-            vocab,
-            vec![
-                Box::new(embeddings),
-                Box::new(block1),
-                Box::new(parallel_block2),
-                Box::new(block3),
-                Box::new(out),
-            ],
+        let cp = llm_checkpoint_v2::new(
+            tokenizer_cp,
+            topology,
+            v_params,
+            crate::MAX_SEQ_LEN,
+            crate::EMBEDDING_DIM,
+            crate::HIDDEN_DIM,
         );
 
+        let s_json = crate::utils::checkpoint_to_json_ascii(&cp)?;
+        crate::utils::write_file_atomic_ascii(s_path, &s_json)?;
+        Ok(())
+    }
+
+    pub fn load_checkpoint_llm_checkpoint_v2_rebuild(s_path: &str) -> Result<crate::layer::Llm, String> {
+        if s_path.trim().is_empty() {
+            return Err("checkpoint_path_empty".to_string());
+        }
+
+        let s_json = std::fs::read_to_string(s_path).map_err(|_| "checkpoint_read_error".to_string())?;
+        let cp: llm_checkpoint_v2 = crate::utils::checkpoint_from_json_ascii(&s_json)?;
+        cp.validate()?;
+
+        let bpe = crate::tokenizer::BpeTokenizer::from_checkpoint(&cp.tokenizer)?;
+        let vocab = bpe.vocab.clone();
+
+        let network = build_network_from_topology(&cp.topology, &vocab)?;
+
+        let mut llm = crate::layer::Llm::new(vocab, network);
         llm.set_bpe_tokenizer(bpe);
+
         llm.set_residual_dropout_p(0.1);
         llm.set_training(true);
         let _ = llm.set_sampling_config(0.9, 40, 0.95, 987654321);
 
         let i_expected: usize = llm.network.iter().map(|l| l.get_parameters_flat().len()).sum();
         if i_expected != cp.v_params.len() {
-            return Err("checkpoint_param_count_mismatch".to_string());
+            return Err(format!(
+                "checkpoint_param_count_mismatch expected={} got={}",
+                i_expected,
+                cp.v_params.len()
+            ));
         }
 
         llm.assign_all_parameters_flat(&cp.v_params)?;
-
-        // Best effort diagnostics after load.
         llm.run_post_load_mtb_diagnostics_ascii();
 
         Ok(llm)
     }
+
+    
 
     fn sample_next_token_from_logits(&mut self, a_last_logits: &Array2<f32>) -> Result<usize, String> {
         if a_last_logits.nrows() != 1 || a_last_logits.ncols() == 0 {
