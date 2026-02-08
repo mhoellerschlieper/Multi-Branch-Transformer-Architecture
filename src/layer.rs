@@ -2127,6 +2127,112 @@ fn build_network_from_topology(
     Ok(v_net)
 }
 
+#[derive(Clone, Debug)]
+pub struct PredictStats {
+    // Average probability of the selected token per generation step, in [0, 1].
+    pub d_avg_selected_token_prob: f32,
+
+    // Additional prediction metrics.
+    // Perplexity proxy: exp(mean(-ln(p_selected))) computed from selected token probabilities.
+    pub d_perplexity_selected: f32,
+
+    // Average entropy (nats) of next token distribution at each generation step.
+    pub d_avg_next_token_entropy_nat: f32,
+
+    // Average margin between top1 and top2 probabilities at each generation step.
+    pub d_avg_top1_top2_margin: f32,
+
+    // Count of generation steps used for these stats.
+    pub i_steps: usize,
+}
+
+impl PredictStats {
+    pub fn empty() -> Self {
+        Self {
+            d_avg_selected_token_prob: 0.0,
+            d_perplexity_selected: 0.0,
+            d_avg_next_token_entropy_nat: 0.0,
+            d_avg_top1_top2_margin: 0.0,
+            i_steps: 0,
+        }
+    }
+}
+
+fn sanitize_f32_local(d_x: f32) -> f32 {
+    if d_x.is_finite() { d_x } else { 0.0 }
+}
+
+fn clamp_prob_local(d_x: f32) -> f32 {
+    if !d_x.is_finite() {
+        return 0.0;
+    }
+    if d_x < 0.0 {
+        0.0
+    } else if d_x > 1.0 {
+        1.0
+    } else {
+        d_x
+    }
+}
+
+fn entropy_nat_local(v_p: &[f32]) -> f32 {
+    let mut d_h: f32 = 0.0;
+    for &p in v_p.iter() {
+        let d_p = clamp_prob_local(p);
+        if d_p > 0.0 {
+            d_h -= d_p * d_p.max(1e-12).ln();
+        }
+    }
+    sanitize_f32_local(d_h)
+}
+
+fn top1_top2_margin_local(v_p: &[f32]) -> f32 {
+    if v_p.is_empty() {
+        return 0.0;
+    }
+
+    let mut d_top1: f32 = -1.0;
+    let mut d_top2: f32 = -1.0;
+
+    for &p in v_p.iter() {
+        let d_p = clamp_prob_local(p);
+        if d_p > d_top1 {
+            d_top2 = d_top1;
+            d_top1 = d_p;
+        } else if d_p > d_top2 {
+            d_top2 = d_p;
+        }
+    }
+
+    let d_margin = (d_top1 - d_top2).max(0.0);
+    sanitize_f32_local(d_margin)
+}
+
+fn mean_vec_f32_local(v_x: &[f32]) -> f32 {
+    if v_x.is_empty() {
+        return 0.0;
+    }
+    let mut d_sum: f32 = 0.0;
+    for &d in v_x.iter() {
+        d_sum += sanitize_f32_local(d);
+    }
+    sanitize_f32_local(d_sum / (v_x.len() as f32).max(1.0))
+}
+
+fn compute_perplexity_from_selected_probs_local(v_p_sel: &[f32]) -> f32 {
+    if v_p_sel.is_empty() {
+        return 0.0;
+    }
+
+    let mut d_sum_nll: f32 = 0.0;
+    for &p in v_p_sel.iter() {
+        let d_p = clamp_prob_local(p).max(1e-12);
+        d_sum_nll += -d_p.ln();
+    }
+    let d_mean_nll = d_sum_nll / (v_p_sel.len() as f32).max(1.0);
+    sanitize_f32_local(d_mean_nll.exp())
+}
+
 // ----------------------------------------
 // Llm
 // ----------------------------------------
@@ -2630,6 +2736,135 @@ impl Llm {
             .map(|v_out_ids| self.decode_ids(&v_out_ids));
 
         // Cleanup only if enabled.
+        if self.b_outage_simulation_enabled {
+            self.clear_predict_outage_for_all_parallel_groups_test_only();
+        }
+
+        self.set_training(b_prev);
+        r
+    }
+
+    // - 2026-02-08: Add forward_generate_with_stats to support prediction metrics reporting.
+    fn forward_generate_with_stats(&mut self, s_text: &str) -> Result<(Vec<usize>, PredictStats), String> {
+        let mut v_context = self.tokenize(s_text)?;
+        let mut v_generated: Vec<usize> = Vec::new();
+
+        if v_context.len() >= MAX_SEQ_LEN {
+            return Ok((v_generated, PredictStats::empty()));
+        }
+
+        let opt_eos = self.vocab.encode(S_EOS);
+
+        // Collect per step stats.
+        let mut v_selected_probs: Vec<f32> = Vec::new();
+        let mut v_entropies: Vec<f32> = Vec::new();
+        let mut v_margins: Vec<f32> = Vec::new();
+
+        for _ in 0..(MAX_SEQ_LEN - v_context.len()) {
+            let a_token_input: Array2<f32> = Array2::from_shape_vec(
+                (1, v_context.len()),
+                v_context.iter().map(|&x| x as f32).collect::<Vec<f32>>(),
+            )
+            .map_err(|_| "shape_error_token_input".to_string())?;
+
+            let mut a_act = a_token_input;
+            for layer in self.network.iter_mut() {
+                a_act = layer.forward(&a_act);
+            }
+
+            let a_logits = a_act;
+            if a_logits.nrows() == 0 || a_logits.ncols() == 0 {
+                return Err("empty_logits".to_string());
+            }
+
+            let a_last_logits = a_logits
+                .row(a_logits.nrows().saturating_sub(1))
+                .to_owned()
+                .insert_axis(Axis(0));
+
+            // Compute distribution for stats (and also for sampling).
+            let i_vocab = a_last_logits.ncols();
+            if i_vocab == 0 {
+                return Err("sampling_vocab_zero".to_string());
+            }
+
+            let d_temperature = if self.d_temperature.is_finite() && self.d_temperature > 0.0 {
+                self.d_temperature
+            } else {
+                1.0
+            };
+            let d_temp = d_temperature.max(1e-6);
+
+            let mut a_scaled = a_last_logits.clone();
+            for d in a_scaled.iter_mut() {
+                if !d.is_finite() {
+                    *d = 0.0;
+                } else {
+                    *d = *d / d_temp;
+                }
+            }
+
+            let a_probs = crate::math::softmax_rows(&a_scaled);
+            if a_probs.nrows() != 1 || a_probs.ncols() != i_vocab {
+                return Err("sampling_probs_shape_invalid".to_string());
+            }
+
+            // Entropy and top1-top2 margin on full distribution.
+            let mut v_p: Vec<f32> = Vec::with_capacity(i_vocab);
+            for j in 0..i_vocab {
+                v_p.push(clamp_prob_local(a_probs[[0, j]]));
+            }
+            v_entropies.push(entropy_nat_local(&v_p));
+            v_margins.push(top1_top2_margin_local(&v_p));
+
+            // Sample next token using existing method (keeps topk/topp semantics).
+            let i_next = self.sample_next_token_from_logits(&a_last_logits)?;
+
+            // Selected token probability from full distribution.
+            let d_p_sel = if i_next < i_vocab { a_probs[[0, i_next]] } else { 0.0 };
+            v_selected_probs.push(clamp_prob_local(d_p_sel));
+
+            v_generated.push(i_next);
+            v_context.push(i_next);
+
+            if let Some(i_eos) = opt_eos {
+                if i_next == i_eos {
+                    break;
+                }
+            }
+        }
+
+        let d_avg_p_sel = mean_vec_f32_local(&v_selected_probs);
+        let d_ppl = compute_perplexity_from_selected_probs_local(&v_selected_probs);
+        let d_avg_h = mean_vec_f32_local(&v_entropies);
+        let d_avg_margin = mean_vec_f32_local(&v_margins);
+
+        let stats = PredictStats {
+            d_avg_selected_token_prob: d_avg_p_sel,
+            d_perplexity_selected: d_ppl,
+            d_avg_next_token_entropy_nat: d_avg_h,
+            d_avg_top1_top2_margin: d_avg_margin,
+            i_steps: v_selected_probs.len(),
+        };
+
+        Ok((v_generated, stats))
+    }
+
+    // History:
+    // - 2026-02-08: Add predict_with_stats for post predict metrics in main.rs.
+    pub fn predict_with_stats(&mut self, s_text: &str) -> Result<(String, PredictStats), String> {
+        let b_prev = self.b_training;
+        self.set_training(false);
+
+        if self.b_outage_simulation_enabled {
+            self.set_predict_outage_for_all_parallel_groups_test_only();
+        }
+
+        let r = self.forward_generate_with_stats(s_text).map(|(v_out_ids, st)| {
+            let s_out = self.decode_ids(&v_out_ids);
+            (s_out, st)
+        });
+
         if self.b_outage_simulation_enabled {
             self.clear_predict_outage_for_all_parallel_groups_test_only();
         }

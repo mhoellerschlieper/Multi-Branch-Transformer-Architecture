@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use crate::layer::{
     Embeddings, Layer, Llm, OutputProjection, ParallelBlockGroup, TransformerBlock,
-    TransformerSequence,
+    TransformerSequence, PredictStats
 };
 use crate::tokenizer::{BpeTokenizer, BpeTokenizerConfig};
 use crate::train::{Dataset, DatasetType};
@@ -154,30 +154,6 @@ fn topology_to_ascii_lines(llm: &mut Llm) -> Vec<String> {
     v_out
 }
 
-// Print MTB metrics and an ASCII report (manual trigger).
-fn print_metrics_ascii(llm: &mut Llm) {
-    // History:
-    // - 2026-02-08: Add menu command M to print MTB diagnostics.
-    println!("");
-    println!("=== Metrics (MTB diagnostics) ===");
-    llm.run_post_load_mtb_diagnostics_ascii();
-}
-
-// Post predict runtime metrics.
-#[derive(Clone, Debug)]
-struct predict_metrics_ascii {
-    // Primary metrics requested.
-    d_duration_ms: f64,
-    i_generated_tokens: usize,
-    d_tokens_per_sec: f64,
-
-    // Five additional metrics (new).
-    i_input_tokens: usize,
-    i_total_tokens: usize,
-    d_avg_chars_per_token_out: f64,
-    d_output_chars_per_sec: f64,
-    d_effective_context_utilization: f64,
-}
 
 fn clamp_f64(d_x: f64, d_min: f64, d_max: f64) -> f64 {
     if !d_x.is_finite() {
@@ -192,69 +168,122 @@ fn clamp_f64(d_x: f64, d_min: f64, d_max: f64) -> f64 {
     }
 }
 
+#[derive(Clone, Debug)]
+struct predict_metrics_ascii {
+    // Primary metrics requested.
+    d_duration_ms: f64,
+    i_generated_tokens: usize,
+    d_tokens_per_sec: f64,
+
+    // Additional runtime/text metrics.
+    i_input_tokens: usize,
+    i_total_tokens: usize,
+    i_output_chars: usize,
+    d_avg_chars_per_token_out: f64,
+    d_output_chars_per_sec: f64,
+    d_effective_context_utilization: f64,
+
+    // Prediction related metrics (new).
+    d_avg_selected_token_prob: f64,
+    d_perplexity_selected: f64,
+    d_avg_next_token_entropy_nat: f64,
+    d_avg_top1_top2_margin: f64,
+    i_pred_stats_steps: usize,
+}
+
 fn compute_predict_metrics_ascii(
     llm: &Llm,
     s_prompt: &str,
     s_output: &str,
     d_duration_ms: f64,
+    opt_stats: Option<&PredictStats>,
 ) -> predict_metrics_ascii {
-    // NOTE:
-    // Token counts are computed via the tokenizer path if available.
-    // This is safe but can be computationally nontrivial; however, it is acceptable
-    // for interactive CLI diagnostics.
-
     let i_input_tokens = llm.tokenize(s_prompt).map(|v| v.len()).unwrap_or(0);
-
-    // Output token count: encode output as standalone text.
-    // This approximates generated token count; if the model emits special tokens,
-    // decode filters them, so the re-encoding count can be slightly different.
     let i_output_tokens = llm.tokenize(s_output).map(|v| v.len()).unwrap_or(0);
-
     let i_total_tokens = i_input_tokens.saturating_add(i_output_tokens);
 
     let d_sec = (d_duration_ms / 1000.0).max(1e-9);
     let d_tokens_per_sec = (i_output_tokens as f64) / d_sec;
 
-    let i_out_chars = s_output.len();
+    let i_output_chars = s_output.len();
     let d_avg_chars_per_token_out = if i_output_tokens == 0 {
         0.0
     } else {
-        (i_out_chars as f64) / (i_output_tokens as f64)
+        (i_output_chars as f64) / (i_output_tokens as f64)
     };
-    let d_output_chars_per_sec = (i_out_chars as f64) / d_sec;
+    let d_output_chars_per_sec = (i_output_chars as f64) / d_sec;
 
-    // Effective context utilization: total tokens relative to MAX_SEQ_LEN.
-    // This provides a quick indication of truncation risk and headroom.
     let d_effective_context_utilization =
         (i_total_tokens as f64) / (crate::MAX_SEQ_LEN as f64).max(1.0);
+
+    // Prediction stats (safe defaults if not available).
+    let (d_avg_p, d_ppl, d_h, d_margin, i_steps) = match opt_stats {
+        Some(st) => (
+            st.d_avg_selected_token_prob as f64,
+            st.d_perplexity_selected as f64,
+            st.d_avg_next_token_entropy_nat as f64,
+            st.d_avg_top1_top2_margin as f64,
+            st.i_steps,
+        ),
+        None => (0.0, 0.0, 0.0, 0.0, 0),
+    };
 
     predict_metrics_ascii {
         d_duration_ms: clamp_f64(d_duration_ms, 0.0, 1.0e12),
         i_generated_tokens: i_output_tokens,
         d_tokens_per_sec: clamp_f64(d_tokens_per_sec, 0.0, 1.0e12),
+
         i_input_tokens,
         i_total_tokens,
+        i_output_chars,
         d_avg_chars_per_token_out: clamp_f64(d_avg_chars_per_token_out, 0.0, 1.0e9),
         d_output_chars_per_sec: clamp_f64(d_output_chars_per_sec, 0.0, 1.0e12),
         d_effective_context_utilization: clamp_f64(d_effective_context_utilization, 0.0, 1.0),
+
+        d_avg_selected_token_prob: clamp_f64(d_avg_p, 0.0, 1.0),
+        d_perplexity_selected: clamp_f64(d_ppl, 0.0, 1.0e12),
+        d_avg_next_token_entropy_nat: clamp_f64(d_h, 0.0, 1.0e12),
+        d_avg_top1_top2_margin: clamp_f64(d_margin, 0.0, 1.0),
+        i_pred_stats_steps: i_steps,
     }
 }
 
 fn print_predict_metrics_ascii(m: &predict_metrics_ascii) {
-    // Output format is ASCII only.
-    println!("");
+    println!();
     println!("=== Predict Metrics ===");
     println!("duration_ms: {:.3}", m.d_duration_ms);
     println!("generated_tokens: {}", m.i_generated_tokens);
     println!("tokens_per_sec: {:.3}", m.d_tokens_per_sec);
+
     println!("input_tokens: {}", m.i_input_tokens);
     println!("total_tokens: {}", m.i_total_tokens);
+    println!("output_chars: {}", m.i_output_chars);
     println!("avg_chars_per_token_out: {:.3}", m.d_avg_chars_per_token_out);
     println!("output_chars_per_sec: {:.3}", m.d_output_chars_per_sec);
     println!(
         "effective_context_utilization: {:.6}",
         m.d_effective_context_utilization
     );
+
+    println!("avg_selected_token_prob: {:.6}", m.d_avg_selected_token_prob);
+    println!("perplexity_selected: {:.6}", m.d_perplexity_selected);
+    println!(
+        "avg_next_token_entropy_nat: {:.6}",
+        m.d_avg_next_token_entropy_nat
+    );
+    println!("avg_top1_top2_margin: {:.6}", m.d_avg_top1_top2_margin);
+    println!("pred_stats_steps: {}", m.i_pred_stats_steps);
+}
+
+// Run MTB metrics and print an ASCII report.
+// This reuses layer.rs implementation by calling the post-load diagnostics routine.
+// NOTE: It prints only if ParallelBlockGroup exists and valid diagnostic samples can be built.
+fn print_metrics_ascii(llm: &mut Llm) {
+    // History:
+    // - 2026-02-08: Add menu command M to print MTB diagnostics.
+    println!("");
+    println!("=== Metrics (MTB diagnostics) ===");
+    llm.run_post_load_mtb_diagnostics_ascii();
 }
 
 fn main() {
@@ -293,6 +322,7 @@ fn main() {
     println!("Total parameters: {}", llm.total_parameters());
 
     loop {
+        println!("\n");
         println!("\n--- Menu Mode ---");
         println!("Commands:");
         println!("  t Train");
@@ -444,6 +474,7 @@ fn main() {
         if s_cmd_lc == "a" {
             println!("Interactive mode. Type 'done' to exit.");
             loop {
+                println!("\n");
                 print!("Enter prompt: ");
                 let _ = std::io::stdout().flush();
 
@@ -466,29 +497,25 @@ fn main() {
 
                 let s_formatted = format!("User: {}", s_user);
 
-                // Metrics timing starts immediately before predict.
                 let t0 = Instant::now();
-                let r_predict = llm.predict(&s_formatted);
+                let r_predict = llm.predict_with_stats(&s_formatted);
                 let d_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
                 match r_predict {
-                    Ok(s_out) => {
+                    Ok((s_out, st)) => {
                         println!("Model output: {}", s_out);
 
-                        // After each ask/predict, print the requested metrics.
-                        let m = compute_predict_metrics_ascii(&llm, &s_formatted, &s_out, d_ms);
+                        let m = compute_predict_metrics_ascii(&llm, &s_formatted, &s_out, d_ms, Some(&st));
                         print_predict_metrics_ascii(&m);
                     }
                     Err(e) => {
                         println!("Model output error: {}", e);
 
-                        // Still print minimal metrics even on error.
-                        let m = compute_predict_metrics_ascii(&llm, &s_formatted, "", d_ms);
+                        let m = compute_predict_metrics_ascii(&llm, &s_formatted, "", d_ms, None);
                         print_predict_metrics_ascii(&m);
                     }
                 }
             }
-
             continue;
         }
 
