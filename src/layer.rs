@@ -31,6 +31,7 @@ use rand::{Rng, SeedableRng};
 use rand_distr::weighted::WeightedIndex;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
+use rayon::prelude::*;
 
 use crate::{EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN};
 use crate::math;
@@ -91,7 +92,7 @@ impl Vocab {
 // Layer trait
 // ----------------------------------------
 
-pub trait Layer {
+pub trait Layer: Send {
     fn layer_type(&self) -> &str;
 
     // Conventions:
@@ -1543,12 +1544,25 @@ pub struct ParallelBlockGroup {
     opt_fault_drop_branch_idx: Option<usize>,
 }
 
+// layer.rs
+// Description: ParallelBlockGroup implementation with parallel forward and backward execution
+//              of branch layers using Rayon, including fault injection controls, training
+//              configuration propagation, and MTB diagnostics input metrics computation.
+//
+// History:
+// - 2026-02-07: Add MTB ParallelBlockGroup with fault injection and diagnostics.
+// - 2026-02-11: Parallelize forward and backward branch execution via Rayon for training and predict.
+// Author: Marcus Schlieper
+
+
 impl ParallelBlockGroup {
     pub fn new(v_branches: Vec<Box<dyn Layer>>) -> Result<Self, String> {
         if v_branches.is_empty() {
             return Err("parallel_block_group_empty".to_string());
         }
+
         let d_w = 1.0f32 / (v_branches.len() as f32).max(1.0);
+
         Ok(Self {
             v_branches,
             d_equal_weight: d_w,
@@ -1596,7 +1610,10 @@ impl ParallelBlockGroup {
                 tb.set_training(b_training);
                 continue;
             }
-            if let Some(ts) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerSequence>()) {
+            if let Some(ts) = br
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<TransformerSequence>())
+            {
                 ts.set_training(b_training);
                 continue;
             }
@@ -1609,7 +1626,10 @@ impl ParallelBlockGroup {
                 tb.set_residual_dropout_p(d_p);
                 continue;
             }
-            if let Some(ts) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerSequence>()) {
+            if let Some(ts) = br
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<TransformerSequence>())
+            {
                 ts.set_residual_dropout_p(d_p);
                 continue;
             }
@@ -1625,23 +1645,32 @@ impl ParallelBlockGroup {
                 tb.reseed_dropout(u64_branch_seed);
                 continue;
             }
-            if let Some(ts) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerSequence>()) {
+            if let Some(ts) = br
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<TransformerSequence>())
+            {
                 ts.reseed_dropout(u64_branch_seed);
                 continue;
             }
         }
     }
 
+    // Sequential helper retained for diagnostics and for cases where deterministic
+    // layer execution order is desired.
     pub fn forward_branches(&mut self, a_input: &Array2<f32>) -> Vec<Array2<f32>> {
         let mut v_out: Vec<Array2<f32>> = Vec::with_capacity(self.v_branches.len());
         for br in self.v_branches.iter_mut() {
-            let a_y = br.forward(a_input);
-            v_out.push(a_y);
+            v_out.push(br.forward(a_input));
         }
         v_out
     }
 
-    pub fn compute_metrics_from_inputs(&mut self, v_inputs: &[Array2<f32>]) -> Result<ParallelBlockGroupMetrics, String> {
+    // Compute MTB diagnostics metrics from a set of inputs that already represent the activation
+    // directly before this ParallelBlockGroup.
+    pub fn compute_metrics_from_inputs(
+        &mut self,
+        v_inputs: &[Array2<f32>],
+    ) -> Result<ParallelBlockGroupMetrics, String> {
         let i_k = self.v_branches.len();
         if i_k == 0 {
             return Err("parallel_block_group_no_paths".to_string());
@@ -1665,6 +1694,9 @@ impl ParallelBlockGroup {
                 continue;
             }
 
+            // NOTE: Uses sequential helper to keep metric computation stable and comparable.
+            // The forward of the group itself may be parallel, but diagnostics typically aims
+            // at interpretability rather than maximum throughput.
             let v_branch_out = self.forward_branches(a_in);
 
             let mut v_scores: Vec<f32> = Vec::with_capacity(i_k);
@@ -1717,12 +1749,21 @@ impl ParallelBlockGroup {
                     let d_dist = 1.0 - d_sim;
                     d_sim_sum += d_sim;
                     d_dist_sum += d_dist;
-                    i_pairs += 1;
+                    i_pairs = i_pairs.saturating_add(1);
                 }
             }
 
-            let d_div = if i_pairs == 0 { 0.0 } else { d_dist_sum / (i_pairs as f32).max(1.0) };
-            let d_corr = if i_pairs == 0 { 0.0 } else { d_sim_sum / (i_pairs as f32).max(1.0) };
+            let d_div = if i_pairs == 0 {
+                0.0
+            } else {
+                d_dist_sum / (i_pairs as f32).max(1.0)
+            };
+
+            let d_corr = if i_pairs == 0 {
+                0.0
+            } else {
+                d_sim_sum / (i_pairs as f32).max(1.0)
+            };
 
             v_energy_all.extend(v_energy.into_iter());
 
@@ -1759,6 +1800,7 @@ impl ParallelBlockGroup {
     }
 }
 
+
 impl Layer for ParallelBlockGroup {
     fn layer_type(&self) -> &str {
         "ParallelBlockGroup"
@@ -1774,26 +1816,42 @@ impl Layer for ParallelBlockGroup {
             return Array2::zeros((0, 0));
         }
 
-        let opt_drop = if self.b_fault_injection_enabled {
+        let opt_drop: Option<usize> = if self.b_fault_injection_enabled {
             self.opt_fault_drop_branch_idx
         } else {
             None
         };
 
+        // Parallel branch execution.
+        let v_outs: Vec<Option<Array2<f32>>> = self
+            .v_branches
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i_idx, br)| {
+                if let Some(i_drop) = opt_drop {
+                    if i_idx == i_drop {
+                        return None;
+                    }
+                }
+
+                let a_y = br.forward(a_input);
+                if a_y.nrows() == 0 || a_y.ncols() == 0 {
+                    None
+                } else {
+                    Some(a_y)
+                }
+            })
+            .collect();
+
+        // Sequential aggregation (stable behavior and clear shape checks).
         let mut opt_sum: Option<Array2<f32>> = None;
         let mut i_used_branches: usize = 0;
 
-        for (i_idx, br) in self.v_branches.iter_mut().enumerate() {
-            if let Some(i_drop) = opt_drop {
-                if i_idx == i_drop {
-                    continue;
-                }
-            }
-
-            let a_y = br.forward(a_input);
-            if a_y.nrows() == 0 || a_y.ncols() == 0 {
-                continue;
-            }
+        for opt_a in v_outs.into_iter() {
+            let a_y = match opt_a {
+                Some(a) => a,
+                None => continue,
+            };
 
             match &mut opt_sum {
                 None => {
@@ -1828,13 +1886,20 @@ impl Layer for ParallelBlockGroup {
             return a_grads.clone();
         }
 
+        // Parallel branch backward.
+        let v_grad_x: Vec<Array2<f32>> = self
+            .v_branches
+            .par_iter_mut()
+            .map(|br| br.backward(a_grads, d_lr))
+            .collect();
+
+        // Sequential sum with strict shape validation.
         let mut a_grad_x_total = Array2::zeros(a_grads.raw_dim());
-        for br in self.v_branches.iter_mut() {
-            let a_grad_x = br.backward(a_grads, d_lr);
-            if a_grad_x.raw_dim() != a_grad_x_total.raw_dim() {
+        for a_gx in v_grad_x.into_iter() {
+            if a_gx.raw_dim() != a_grad_x_total.raw_dim() {
                 return a_grads.clone();
             }
-            a_grad_x_total = a_grad_x_total + a_grad_x;
+            a_grad_x_total = a_grad_x_total + a_gx;
         }
 
         a_grad_x_total
@@ -1865,7 +1930,6 @@ impl Layer for ParallelBlockGroup {
         Some(self)
     }
 }
-
 
 // ---------------------------
 // Topology spec for checkpoint
