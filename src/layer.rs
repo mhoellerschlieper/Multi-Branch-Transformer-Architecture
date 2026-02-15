@@ -4272,10 +4272,10 @@ impl Llm {
 
         // Drift prompts (10).
         let v_drift_prompts: Vec<String> = vec![
-            "User: diagnostic prompt 1".to_string(),
-            "User: diagnostic prompt 2".to_string(),
-            "User: diagnostic prompt 3".to_string(),
-            "User: diagnostic prompt 4".to_string(),
+            "User: Wie hoch ist der Mount Everest?".to_string(),
+            "User: Wie heißt der Mount Everest in Tibet?".to_string(),
+            "User: Wie viele Tage vergehen, bis der Mond die Erde einmal umrundet, und weshalb existieren dabei unterschiedliche Angaben?".to_string(),
+            "User: Wie sind Katzen?".to_string(),
         ];
 
         for i_epoch in 0..i_epochs {
@@ -4483,7 +4483,7 @@ impl Llm {
                         i_epochs,
                         d_running_epoch_avg_loss,
                         d_last_step_loss,
-                        0,
+                        i_used_rows,
                         i_total_steps,
                     );
 
@@ -5694,10 +5694,10 @@ pub fn train_with_progress_continuous_learning_ascii(
                 // Build activations before PG using existing helper if available; otherwise use
                 // collect_parallel_block_group_inputs_for_diagnostics with fixed prompts.
                 let v_prompts: Vec<String> = vec![
-                    "User: diagnostic prompt 1".to_string(),
-                    "User: diagnostic prompt 2".to_string(),
-                    "User: diagnostic prompt 3".to_string(),
-                    "User: diagnostic prompt 4".to_string(),
+                    "User: Wie hoch ist der Mount Everest?".to_string(),
+                    "User: Wie heißt der Mount Everest in Tibet?".to_string(),
+                    "User: Wie viele Tage vergehen, bis der Mond die Erde einmal umrundet, und weshalb existieren dabei unterschiedliche Angaben?".to_string(),
+                    "User: Wie sind Katzen?".to_string(),
                 ];
 
                 let v_diag_inputs = self
@@ -5717,7 +5717,7 @@ pub fn train_with_progress_continuous_learning_ascii(
                     i_epochs,
                     d_running_epoch_avg_loss,
                     d_last_step_loss,
-                    0,
+                    i_used_rows,
                     i_total_steps,
                 );
                 ev.i_skips_empty_act = i_skips_empty_act;
@@ -5907,14 +5907,14 @@ pub fn train_with_progress_continuous_learning_ascii(
         self.set_training(false);
 
         let v_prompts: Vec<String> = vec![
-            "User: Explain transformers briefly.".to_string(),
-            "User: Summarize the concept of attention.".to_string(),
-            "User: What is gradient clipping?".to_string(),
-            "User: Provide a short definition of entropy.".to_string(),
-            "User: Describe tokenization.".to_string(),
+            "User: Was ist das Prinzip der kleinsten Wirkung?".to_string(),
+            "User: Was ist Heisenbergs Unschärferelation?".to_string(),
+            "User: erzähle etwas über den mount Everest.".to_string(),
+            "User: Wie entstehen Gebirge?".to_string(),
+            "User: Wie wird Glas hergestellt?".to_string(),
             "User: How do mountains form?".to_string(),
-            "User: Explain causal masking.".to_string(),
-            "User: Define overfitting.".to_string(),
+            "User: Wie wird Schokolade hergestellt?".to_string(),
+            "User: Wie sind Katzen?.".to_string(),
         ];
 
         let v_inputs = match self.collect_parallel_block_group_inputs_for_diagnostics(&v_prompts, 8) {
