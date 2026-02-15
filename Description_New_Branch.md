@@ -1,6 +1,6 @@
 ## Zeitpunkt und Ausloeser fuer das Hinzufuegen eines neuen Branches
 
-Im obigen Code kommt ein neuer Branch **ausschliesslich** im Rahmen der **autonomen Expansion** des ersten `ParallelBlockGroup` hinzu, und zwar dann, wenn die Trainingsschleife regelmaessig eine Expansion prueft, bestimmte Diagnostikmetriken einen Engpass anzeigen und die konfigurierten Sicherheitsgrenzen eine Erweiterung erlauben.
+Im MBT kommt ein neuer Branch **ausschliesslich** im Rahmen der **autonomen Expansion** des ersten `ParallelBlockGroup` hinzu, und zwar dann, wenn die Trainingsschleife regelmaessig eine Expansion prueft, bestimmte Diagnostikmetriken einen Engpass anzeigen und die konfigurierten Sicherheitsgrenzen eine Erweiterung erlauben.
 
 ### 1. Wo im Code wird die Expansion angestossen
 

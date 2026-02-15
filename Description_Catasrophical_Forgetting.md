@@ -2,7 +2,7 @@
 
 ## Einordnung und begriffliche Praezisierung
 
-Im vorliegenden Quelltext wird **catastrophic forgetting** nicht als formal garantiert verhindertes Phaenomen behandelt, sondern als **operational adressiertes Risiko** im Rahmen eines kontinuierlichen Trainingssettings, in dem neue Trainingsdaten online hinzukommen, Teilmodelle (Branches) selektiv trainiert werden und sich die Modelltopologie potenziell erweitert; die Vermeidung bzw Reduktion katastrophalen Vergessens erfolgt dabei ueber mehrere, im Code explizit erkennbare Mechanismen, die zusammen primaer darauf abzielen, (a) die Verteilung der Trainingssignale zu stabilisieren, (b) die Abweichung der Funktion nach strukturellen Aenderungen zu begrenzen und (c) die Leistung auf frueheren Daten systematisch zu ueberwachen.
+Im MBT wird **catastrophic forgetting** nicht als formal garantiert verhindertes Phaenomen behandelt, sondern als **operational adressiertes Risiko** im Rahmen eines kontinuierlichen Trainingssettings, in dem neue Trainingsdaten online hinzukommen, Teilmodelle (Branches) selektiv trainiert werden und sich die Modelltopologie potenziell erweitert; die Vermeidung bzw Reduktion katastrophalen Vergessens erfolgt dabei ueber mehrere, im Code explizit erkennbare Mechanismen, die zusammen primaer darauf abzielen, (a) die Verteilung der Trainingssignale zu stabilisieren, (b) die Abweichung der Funktion nach strukturellen Aenderungen zu begrenzen und (c) die Leistung auf frueheren Daten systematisch zu ueberwachen.
 
 ## 1) Experience Replay als zentraler Anti Forgetting Mechanismus
 

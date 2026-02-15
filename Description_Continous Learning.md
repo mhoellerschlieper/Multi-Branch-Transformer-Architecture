@@ -1,7 +1,7 @@
 ## Implementierung von Continuous Learning
 
 ### 1. Begrifflicher Rahmen und Abgrenzung im Codekontext
-Im vorliegenden Quelltext wird *Continuous Learning* als ein Trainingsmodus operationalisiert, der (a) fortlaufend neue Trainingsdaten waehrend des laufenden Trainings akzeptiert, (b) die Modellaktualisierung ohne harte Trainingsstopps ermoeglicht, (c) eine partielle Aktivierung und selektive Aktualisierung von Modellteilen (Branches) zulaesst und (d) die Modellkapazitaet bei Bedarf autonom erweitern kann, waehrend parallel dazu Diagnostik, Fortschrittsereignisse und Snapshot-Mechanismen die Einbettung in einen produktionsnahen Betrieb (Training neben Serving) stützen.
+Im MBT wird *Continuous Learning* als ein Trainingsmodus operationalisiert, der (a) fortlaufend neue Trainingsdaten waehrend des laufenden Trainings akzeptiert, (b) die Modellaktualisierung ohne harte Trainingsstopps ermoeglicht, (c) eine partielle Aktivierung und selektive Aktualisierung von Modellteilen (Branches) zulaesst und (d) die Modellkapazitaet bei Bedarf autonom erweitern kann, waehrend parallel dazu Diagnostik, Fortschrittsereignisse und Snapshot-Mechanismen die Einbettung in einen produktionsnahen Betrieb (Training neben Serving) stützen.
 
 Technisch ist das Konzept im Code nicht als einzelnes Modul realisiert, sondern als Zusammenspiel mehrerer Bausteine, die in den Trainingsfunktionen der `Llm`-Struktur, in der Multi-Branch-Architektur (`ParallelBlockGroup`) sowie in den Online-Ingestion- und Metrikpfaden zusammengefuehrt werden.
 
