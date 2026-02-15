@@ -4273,7 +4273,7 @@ impl Llm {
         // Drift prompts (10).
         let v_drift_prompts: Vec<String> = vec![
             "User: Wie hoch ist der Mount Everest?".to_string(),
-            "User: Wie heißt der Mount Everest in Tibet?".to_string(),
+            "User: Wie heisst der Mount Everest in Tibet?".to_string(),
             "User: Wie viele Tage vergehen, bis der Mond die Erde einmal umrundet, und weshalb existieren dabei unterschiedliche Angaben?".to_string(),
             "User: Wie sind Katzen?".to_string(),
         ];
@@ -5695,7 +5695,7 @@ pub fn train_with_progress_continuous_learning_ascii(
                 // collect_parallel_block_group_inputs_for_diagnostics with fixed prompts.
                 let v_prompts: Vec<String> = vec![
                     "User: Wie hoch ist der Mount Everest?".to_string(),
-                    "User: Wie heißt der Mount Everest in Tibet?".to_string(),
+                    "User: Wie heisst der Mount Everest in Tibet?".to_string(),
                     "User: Wie viele Tage vergehen, bis der Mond die Erde einmal umrundet, und weshalb existieren dabei unterschiedliche Angaben?".to_string(),
                     "User: Wie sind Katzen?".to_string(),
                 ];
@@ -5908,13 +5908,13 @@ pub fn train_with_progress_continuous_learning_ascii(
 
         let v_prompts: Vec<String> = vec![
             "User: Was ist das Prinzip der kleinsten Wirkung?".to_string(),
-            "User: Was ist Heisenbergs Unschärferelation?".to_string(),
-            "User: erzähle etwas über den mount Everest.".to_string(),
+            "User: Wie hoch ist der Mount Everest?".to_string(),
+            "User: Was ist Selbstinduktion und Induktivitaet?.".to_string(),
             "User: Wie entstehen Gebirge?".to_string(),
             "User: Wie wird Glas hergestellt?".to_string(),
             "User: How do mountains form?".to_string(),
             "User: Wie wird Schokolade hergestellt?".to_string(),
-            "User: Wie sind Katzen?.".to_string(),
+            "User: Wie sind Katzen?".to_string(),
         ];
 
         let v_inputs = match self.collect_parallel_block_group_inputs_for_diagnostics(&v_prompts, 8) {
