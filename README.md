@@ -21,6 +21,7 @@ The current implementation supports uniform averaging as a default aggregation, 
 - [Inference](#inference)
 - [Checkpoints and Reproducibility](#checkpoints-and-reproducibility)
 - [Benchmark with and without outage simulation](#Benchmark)
+- [Metrics](#Metrics)
 - [Topology(Example)](#Topology)
 - [Distributed Execution and Fault Tolerance (Concept)](#distributed-execution-and-fault-tolerance-concept)
 - [Security and Robustness (System Perspective)](#security-and-robustness-system-perspective)
@@ -173,81 +174,76 @@ The multi-branch structure is modeled such that **one path** can serve as a **pa
 Thus, the layer function remains well-defined as long as at least one path is available. In P2P settings, quorum/timeout policies and anti-weight-collapse rules are methodologically central to limit tail latency and single-point-of-failure effects.
 
 ---
-Result Metrics
-The repository exposes two complementary metric families: (i) MTB diagnostics that characterize a ParallelBlockGroup as a width-ensemble object, and (ii) continuous learning and operations metrics that quantify online ingestion, mask sparsity, replay usage, retention stability, and expansion-induced drift. These metrics are deliberately designed to connect implementation behavior with system-level goals such as fault tolerance, non-collapse of width, and continuous extensibility.
+## Result Metrics
+The repository exposes two complementary metric families: 
+(i) MTB diagnostics that characterize a ParallelBlockGroup as a width-ensemble object, and 
+(ii) continuous learning and operations metrics that quantify online ingestion, mask sparsity, replay usage, retention stability, and expansion-induced drift. 
+These metrics are deliberately designed to connect implementation behavior with system-level goals such as fault tolerance, non-collapse of width, and continuous extensibility.
 
-A) MTB Diagnostics (CLI: x)
+# A) MTB Diagnostics (CLI: x)
 MTB diagnostics estimate whether width actually behaves as a set of substitutable or complementary paths, rather than collapsing into a single dominant route.
 
-path_starvation_index (derived from normalized entropy of branch-selection probabilities)
+**path_starvation_index (derived from normalized entropy of branch-selection probabilities)**
 Interpretation: values near 0 indicate relatively uniform usage; values near 1 indicate strong concentration and potential starvation.
 Practical heuristic: > 0.60 indicates severe concentration and a high risk that unused paths fail to learn useful functions.
-
-effective_num_paths 
-≈
-exp
-⁡
-(
-H
-)
-≈exp(H)
+effective_num_paths ≈ exp(H)
 Interpretation: the entropy-derived “effective” count of meaningfully participating paths, bounded by 1..K.
 Practical heuristic: values < 2.0 in a multi-branch layer suggest functional collapse into near-single-path behavior.
 
-gini_concentration and top1_share
+**gini_concentration and top1_share**
 Interpretation: alternative concentration measures; increasing values indicate dominance and impoverishment of width.
 Practical heuristic: top1_share > 0.70 indicates strong dominance; mitigation may require fairness controls, replay, or expansion.
 
-diversity_cosine_distance_mean and branch_correlation_mean
+# diversity_cosine_distance_mean and branch_correlation_mean
 Interpretation: measure geometric similarity of branch outputs; low diversity (high correlation) suggests redundant branches.
 Practical heuristic: sustained high correlation indicates that width may not contribute to robustness under outages, because branch outputs are not functionally distinct.
 
-margin_top1_top2
+# margin_top1_top2
 Interpretation: stability of the internal branch scoring distribution; high margins can indicate deterministic routing pressure toward a single path.
 
-output_energy_cv
+# output_energy_cv
 Interpretation: coefficient of variation of output energy across branches; extreme variability can indicate unstable scaling or mismatch in branch capacity.
 
 Taken together, these metrics provide a measurable proxy for whether MBT is achieving the intended “parallel width with substitutability” property, rather than degenerating into an expensive single-route architecture.
 
-B) Training and Continuous Learning Metrics (CLI: b)
+## B) Training and Continuous Learning Metrics (CLI: b)
 When background training is enabled, the system emits structured progress snapshots that aim to make “continuous, partial-availability learning” operationally observable.
 
-B.1 Ingestion Throughput and Data Health
-ingest_rows_per_sec_window, ingest_events_per_sec_window
+# B.1 Ingestion Throughput and Data Health
+**ingest_rows_per_sec_window, ingest_events_per_sec_window**
 Interpretation: whether online ingestion is progressing; persistent zeros under active ingestion requests indicate stalled drains or missing receiver wiring.
 
-ingest_parse_errors_total, ingest_rows_rejected_total
+**ingest_parse_errors_total, ingest_rows_rejected_total**
 Interpretation: pipeline correctness and data quality; elevated rejection ratios indicate that “continuous learning” may be limited by input quality rather than model capacity.
 
-ingest_pending_events_observed_peak
+**ingest_pending_events_observed_peak**
 Interpretation: a coarse backlog indicator; sustained growth suggests backpressure and delayed adaptation.
 
-B.2 Coverage (Effective Use of Available Data)
-coverage_ratio_used_over_available, new_data_ratio_in_available
+# B.2 Coverage (Effective Use of Available Data)
+**coverage_ratio_used_over_available, new_data_ratio_in_available**
 Interpretation: whether the epoch uses most available rows and how non-stationary the stream is; low coverage can indicate skip-pathologies or frequent invalid rows.
-B.3 Availability Masks and Participation
-active_branches_mean/std/min/max, mask_sparsity_mean/std, steps_at_min_active_share
+# B.3 Availability Masks and Participation
+**active_branches_mean/std/min/max, mask_sparsity_mean/std, steps_at_min_active_share**
 Interpretation: whether training operates in a sparse regime (high variance but lower compute) or a dense regime (lower variance but higher cost).
 For MBT specifically, high sparsity increases the importance of unbiasedness controls (inverse participation scaling) and replay.
-B.4 Inverse Participation Scaling (Unbiasedness Proxy)
-grad_norm_ratio_scaled_over_unscaled_mean/std
+# B.4 Inverse Participation Scaling (Unbiasedness Proxy)
+**grad_norm_ratio_scaled_over_unscaled_mean/std**
 Interpretation: whether inverse participation scaling strongly amplifies gradients; large amplification can require lower learning rates or stronger clipping to preserve stability.
-B.5 Replay and Retention
-replay_share, replay_delta_loss_mean/std
+# B.5 Replay and Retention
+**replay_share, replay_delta_loss_mean/std**
 Interpretation: whether replay is used at meaningful rates and whether replay examples are becoming “harder” (potential drift away from older knowledge) or “too easy” (possible redundancy).
 
-loss_control_old/new, retention_delta_old/new
+**loss_control_old/new, retention_delta_old/new**
 Interpretation: a forgetting proxy on deterministic control slices; persistent positive deltas indicate degradation of prior behavior and motivate increased replay, lower learning rates, or stricter governance.
 
-B.6 Fairness of Width Utilization
-branch_select_gini, branch_select_top1_share
+# B.6 Fairness of Width Utilization
+**branch_select_gini, branch_select_top1_share**
 Interpretation: whether EMA-based selection leads to dominance; high concentration implies that width capacity is not used effectively and that robustness under branch failure is compromised.
-B.7 Expansion and Drift (Continuous Extensibility)
-expansion_events_total, eta_injection_last, sum_w_new_last
+# B.7 Expansion and Drift (Continuous Extensibility)
+**expansion_events_total, eta_injection_last, sum_w_new_last**
 Interpretation: whether the system expands width and how aggressively it injects new branches into the aggregation; aggressive injection increases the probability of behavioral drift.
 
-expand_drift_logits_l2_mean/std, expand_drift_logits_cos_dist_mean/std
+**expand_drift_logits_l2_mean/std, expand_drift_logits_cos_dist_mean/std**
 Interpretation: functional continuity under expansion; large drift suggests that expansion changes the model’s effective function too abruptly and should be mitigated by lower injection rates or stricter expansion triggers.
 
 
@@ -321,6 +317,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
