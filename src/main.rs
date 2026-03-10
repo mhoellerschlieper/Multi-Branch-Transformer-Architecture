@@ -88,7 +88,30 @@ fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
     ])
     .expect("parallel_block_group_new_failed");
 
-    let block3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+
+    let block3_1 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block3_2 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block3_3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block3_4 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block3_5 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block3_6 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block3_7 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block3_8 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+
+    let seq_3_1 =
+        TransformerSequence::new(vec![block3_1, block3_2]).expect("transformer_sequence_new_failed");
+    
+    let seq_3_2 =
+        TransformerSequence::new(vec![block3_5, block3_6]).expect("transformer_sequence_new_failed");
+
+    let parallel_block3 = ParallelBlockGroup::new(vec![
+        Box::new(seq_3_1) as Box<dyn Layer>,
+        Box::new(seq_3_2) as Box<dyn Layer>,
+        
+    ])
+    .expect("parallel_block_group_new_failed");
+
+    let block4 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
     let out = OutputProjection::new(crate::EMBEDDING_DIM, vocab.words.len());
 
     let mut llm = Llm::new(
@@ -97,7 +120,8 @@ fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
             Box::new(embeddings),
             Box::new(block1),
             Box::new(parallel_block2),
-            Box::new(block3),
+            Box::new(parallel_block3),
+            Box::new(block4),
             Box::new(out),
         ],
     );

@@ -59,6 +59,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 pub const DEFAULT_RESIDUAL_DROPOUT_P: f32 = 0.001;
+pub const I_PARALLEL_BLOCK_GROUP_TOP_K: usize = 2;
 
 // ----------------------------------------
 // Vocab
@@ -1452,6 +1453,88 @@ impl ParallelBlockGroup {
         })
     }
 
+    // Top-2 weighted aggregation helper.
+    // Score basis: mean square energy of branch output.
+    // Safety:
+    // - validates shapes
+    // - ignores invalid branches
+    // - normalizes weights
+    fn aggregate_top_2_ascii(
+        &self,
+        v_outs: Vec<Option<Array2<f32>>>,
+    ) -> Array2<f32> {
+        let mut v_scored: Vec<(usize, f32, Array2<f32>)> = Vec::new();
+
+        for (i_idx, opt_a) in v_outs.into_iter().enumerate() {
+            let a_y = match opt_a {
+                Some(v) => v,
+                None => continue,
+            };
+
+            if a_y.nrows() == 0 || a_y.ncols() == 0 {
+                continue;
+            }
+
+            let d_score = math::mean_square_energy_f32(&a_y);
+            let d_score_safe = if d_score.is_finite() && d_score > 0.0 {
+                d_score
+            } else {
+                1.0e-6
+            };
+
+            v_scored.push((i_idx, d_score_safe, a_y));
+        }
+
+        if v_scored.is_empty() {
+            return Array2::zeros((0, 0));
+        }
+
+        // Sort descending by score.
+        v_scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let i_take: usize = v_scored.len().min(2);
+        let v_top: Vec<(usize, f32, Array2<f32>)> = v_scored.into_iter().take(i_take).collect();
+
+        if v_top.is_empty() {
+            return Array2::zeros((0, 0));
+        }
+
+        let mut d_sum_scores: f32 = 0.0;
+        for (_, d_score, _) in v_top.iter() {
+            d_sum_scores += *d_score;
+        }
+
+        if !d_sum_scores.is_finite() || d_sum_scores <= 0.0 {
+            return Array2::zeros((0, 0));
+        }
+
+        let mut opt_sum: Option<Array2<f32>> = None;
+
+        for (_, d_score, a_y) in v_top.into_iter() {
+            let d_w = d_score / d_sum_scores.max(1.0e-12);
+            let a_weighted = a_y.mapv(|x| x * d_w);
+
+            match &mut opt_sum {
+                None => {
+                    opt_sum = Some(a_weighted);
+                }
+                Some(a_acc) => {
+                    if a_acc.raw_dim() != a_weighted.raw_dim() {
+                        return Array2::zeros((0, 0));
+                    }
+                    *a_acc = &*a_acc + &a_weighted;
+                }
+            }
+        }
+
+        match opt_sum {
+            Some(a) => a,
+            None => Array2::zeros((0, 0)),
+        }
+    }
+
     pub fn forward_with_availability_mask(
         &mut self,
         a_input: &Array2<f32>,
@@ -1473,6 +1556,7 @@ impl ParallelBlockGroup {
                 if !v_active_mask[i_idx] {
                     return None;
                 }
+
                 let a_y = br.forward(a_input);
                 if a_y.nrows() == 0 || a_y.ncols() == 0 {
                     None
@@ -1482,42 +1566,9 @@ impl ParallelBlockGroup {
             })
             .collect();
 
-        let mut opt_sum: Option<Array2<f32>> = None;
-        let mut i_used: usize = 0;
-
-        for opt_a in v_outs.into_iter() {
-            let a_y = match opt_a {
-                Some(a) => a,
-                None => continue,
-            };
-            match &mut opt_sum {
-                None => {
-                    opt_sum = Some(a_y);
-                    i_used = i_used.saturating_add(1);
-                }
-                Some(a_acc) => {
-                    if a_acc.raw_dim() != a_y.raw_dim() {
-                        return Array2::zeros((0, 0));
-                    }
-                    *a_acc = &*a_acc + &a_y;
-                    i_used = i_used.saturating_add(1);
-                }
-            }
-        }
-
-        let mut a_out = match opt_sum {
-            None => Array2::zeros((0, 0)),
-            Some(a) => a,
-        };
-
-        // Partial aggregation: average across active branches.
-        let d_w = 1.0f32 / (i_used as f32).max(1.0);
-        if d_w.is_finite() && d_w > 0.0 {
-            a_out.mapv_inplace(|x| x * d_w);
-        }
-
-        a_out
+        self.aggregate_top_2_ascii(v_outs)
     }
+
     pub fn backward_with_availability_mask(
         &mut self,
         a_grads: &Array2<f32>,
@@ -1905,7 +1956,6 @@ impl ParallelBlockGroup {
             return Array2::zeros((0, 0));
         }
 
-        // Parallel forward on active branches.
         let v_outs: Vec<Option<Array2<f32>>> = self
             .v_branches
             .par_iter_mut()
@@ -1914,6 +1964,7 @@ impl ParallelBlockGroup {
                 if !v_active_mask[i_idx] {
                     return None;
                 }
+
                 let a_y = br.forward(a_input);
                 if a_y.nrows() == 0 || a_y.ncols() == 0 {
                     None
@@ -1923,49 +1974,74 @@ impl ParallelBlockGroup {
             })
             .collect();
 
-        // Weighted sum; renormalize over active weights to preserve scale.
-        let mut opt_sum: Option<Array2<f32>> = None;
-        let mut d_active_w_sum: f32 = 0.0;
+        let mut v_scored: Vec<(usize, f32, Array2<f32>)> = Vec::new();
 
         for (i_idx, opt_a) in v_outs.into_iter().enumerate() {
             let a_y = match opt_a {
-                Some(a) => a,
+                Some(v) => v,
                 None => continue,
             };
-            let d_w = self.v_branch_weights[i_idx];
-            if !d_w.is_finite() || d_w <= 0.0 {
+
+            let d_energy = math::mean_square_energy_f32(&a_y);
+            let d_base_w = self.v_branch_weights[i_idx];
+
+            if !d_base_w.is_finite() || d_base_w <= 0.0 {
                 continue;
             }
 
+            let d_score = if d_energy.is_finite() && d_energy > 0.0 {
+                d_energy * d_base_w
+            } else {
+                1.0e-6 * d_base_w
+            };
+
+            v_scored.push((i_idx, d_score, a_y));
+        }
+
+        if v_scored.is_empty() {
+            return Array2::zeros((0, 0));
+        }
+
+        v_scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let i_take: usize = v_scored.len().min(2);
+        let v_top: Vec<(usize, f32, Array2<f32>)> = v_scored.into_iter().take(i_take).collect();
+
+        let mut d_sum_scores: f32 = 0.0;
+        for (_, d_score, _) in v_top.iter() {
+            d_sum_scores += *d_score;
+        }
+
+        if !d_sum_scores.is_finite() || d_sum_scores <= 0.0 {
+            return Array2::zeros((0, 0));
+        }
+
+        let mut opt_sum: Option<Array2<f32>> = None;
+
+        for (_, d_score, a_y) in v_top.into_iter() {
+            let d_w = d_score / d_sum_scores.max(1.0e-12);
+            let a_weighted = a_y.mapv(|x| x * d_w);
+
             match &mut opt_sum {
                 None => {
-                    let mut a_first = a_y;
-                    a_first.mapv_inplace(|x| x * d_w);
-                    opt_sum = Some(a_first);
+                    opt_sum = Some(a_weighted);
                 }
                 Some(a_acc) => {
-                    if a_acc.raw_dim() != a_y.raw_dim() {
+                    if a_acc.raw_dim() != a_weighted.raw_dim() {
                         return Array2::zeros((0, 0));
                     }
-                    *a_acc = &*a_acc + &(a_y.mapv(|x| x * d_w));
+                    *a_acc = &*a_acc + &a_weighted;
                 }
             }
-
-            d_active_w_sum += d_w;
         }
 
-        let mut a_out = match opt_sum {
-            None => Array2::zeros((0, 0)),
+        match opt_sum {
             Some(a) => a,
-        };
-
-        // Renormalize to sum of active weights (avoid shrinking when only few paths active).
-        if d_active_w_sum.is_finite() && d_active_w_sum > 1e-12 {
-            let d_inv = 1.0 / d_active_w_sum;
-            a_out.mapv_inplace(|x| x * d_inv);
+            None => Array2::zeros((0, 0)),
         }
 
-        a_out
     }
 }
 
@@ -1975,6 +2051,7 @@ impl Layer for ParallelBlockGroup {
         "ParallelBlockGroup"
     }
 
+   
     fn forward(&mut self, a_input: &Array2<f32>) -> Array2<f32> {
         if a_input.nrows() == 0 || a_input.ncols() == 0 {
             return a_input.clone();
@@ -2012,42 +2089,7 @@ impl Layer for ParallelBlockGroup {
             })
             .collect();
 
-        // Sequential aggregation (stable behavior and clear shape checks).
-        let mut opt_sum: Option<Array2<f32>> = None;
-        let mut i_used_branches: usize = 0;
-
-        for opt_a in v_outs.into_iter() {
-            let a_y = match opt_a {
-                Some(a) => a,
-                None => continue,
-            };
-
-            match &mut opt_sum {
-                None => {
-                    opt_sum = Some(a_y);
-                    i_used_branches = i_used_branches.saturating_add(1);
-                }
-                Some(a_acc) => {
-                    if a_acc.raw_dim() != a_y.raw_dim() {
-                        return Array2::zeros((0, 0));
-                    }
-                    *a_acc = &*a_acc + &a_y;
-                    i_used_branches = i_used_branches.saturating_add(1);
-                }
-            }
-        }
-
-        let mut a_out = match opt_sum {
-            None => Array2::zeros((0, 0)),
-            Some(a) => a,
-        };
-
-        let d_w = 1.0f32 / (i_used_branches as f32).max(1.0);
-        if d_w.is_finite() && d_w > 0.0 {
-            a_out.mapv_inplace(|x| x * d_w);
-        }
-
-        a_out
+        self.aggregate_top_2_ascii(v_outs)
     }
 
     fn backward(&mut self, a_grads: &Array2<f32>, d_lr: f32) -> Array2<f32> {

@@ -1,6 +1,8 @@
 ## Zeitpunkt und Ausloeser fuer das Hinzufuegen eines neuen Branches
 
-Im MBT kommt ein neuer Branch **ausschliesslich** im Rahmen der **autonomen Expansion** des ersten `ParallelBlockGroup` hinzu, und zwar dann, wenn die Trainingsschleife regelmaessig eine Expansion prueft, bestimmte Diagnostikmetriken einen Engpass anzeigen und die konfigurierten Sicherheitsgrenzen eine Erweiterung erlauben.
+Im MBT kommt ein neuer Branch **ausschliesslich** im Rahmen der **autonomen Expansion** des ersten `ParallelBlockGroup` hinzu, und zwar dann, 
+wenn die Trainingsschleife regelmaessig eine Expansion prueft, bestimmte Diagnostikmetriken einen Engpass anzeigen und die konfigurierten 
+Sicherheitsgrenzen eine Erweiterung erlauben.
 
 ### 1. Wo im Code wird die Expansion angestossen
 
@@ -18,7 +20,8 @@ Erst **an diesen Checkpoints** ist eine Expansion ueberhaupt moeglich.
 
 ### 2. Welche Voraussetzungen muessen erfuellt sein (Guards)
 
-Wenn der Intervall-Trigger greift, wird zusaetzlich geprueft, ob es diagnostisch verwertbare Inputs gibt, denn die Entscheidung basiert auf Metriken, die aus Aktivierungen vor der `ParallelBlockGroup` gewonnen werden:
+Wenn der Intervall-Trigger greift, wird zusaetzlich geprueft, ob es diagnostisch verwertbare Inputs gibt, 
+denn die Entscheidung basiert auf Metriken, die aus Aktivierungen vor der `ParallelBlockGroup` gewonnen werden:
 
 - `collect_parallel_block_group_inputs_for_diagnostics(...)` oder
 - bei der erweiterten Variante im Online-Loop: es werden diagnostische Inputs aus Prompts erzeugt und an `try_autonomous_expand_first_pg_ascii(...)` uebergeben.
